@@ -1,0 +1,84 @@
+{
+  "records": [
+    {
+      "dataset": "demo",
+      "model": "model-b",
+      "index": 1,
+      "prompt": "  Explain alpha.\n",
+      "score": 0.9,
+      "cost": 0.03,
+      "prompt_tokens": 4,
+      "completion_tokens": 12
+    },
+    {
+      "dataset": "demo",
+      "model": "model-a",
+      "index": 1,
+      "prompt": "Explain alpha.",
+      "score": 0.5,
+      "cost": 0.01,
+      "prompt_tokens": 4,
+      "completion_tokens": 8
+    },
+    {
+      "dataset": "demo",
+      "model": "model-c",
+      "index": 1,
+      "prompt": "Explain alpha.",
+      "score": 0.2,
+      "cost": 0.02,
+      "prompt_tokens": 4,
+      "completion_tokens": 9
+    },
+    {
+      "dataset": "demo",
+      "model": "model-a",
+      "index": 2,
+      "prompt": "Solve beta.",
+      "score": 0.1,
+      "cost": 0.01,
+      "prompt_tokens": 3,
+      "completion_tokens": 5
+    },
+    {
+      "dataset": "demo",
+      "model": "model-b",
+      "index": 2,
+      "prompt": "Solve beta.",
+      "score": 0.4,
+      "cost": 0.03,
+      "prompt_tokens": 3,
+      "completion_tokens": 7
+    },
+    {
+      "dataset": "demo",
+      "model": "model-c",
+      "index": 2,
+      "prompt": "Solve beta.",
+      "score": 1.0,
+      "cost": 0.02,
+      "prompt_tokens": 3,
+      "completion_tokens": 10
+    },
+    {
+      "dataset": "demo",
+      "model": "model-a",
+      "index": 3,
+      "prompt": "Incomplete gamma.",
+      "score": 0.3,
+      "cost": 0.01,
+      "prompt_tokens": 3,
+      "completion_tokens": 4
+    },
+    {
+      "dataset": "demo",
+      "model": "model-b",
+      "index": 3,
+      "prompt": "Incomplete gamma.",
+      "score": 0.4,
+      "cost": 0.03,
+      "prompt_tokens": 3,
+      "completion_tokens": 5
+    }
+  ]
+}

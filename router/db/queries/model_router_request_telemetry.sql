@@ -1,0 +1,508 @@
+-- Records a completed proxied request for the dashboard UI and routing
+-- observability. Routing-brain fields (cluster_ids, candidate_models,
+-- chosen_score, candidate_scores, propensity, alpha_breakdown,
+-- cluster_router_version, ttft_ms, cache_*_tokens, device_id, session_id) are
+-- nullable; non-cluster decisions and pinned-route turns leave them NULL.
+-- turn_type is the turntype classification (main_loop, tool_result, probe,
+-- title_gen, compaction, classifier, sub_agent_dispatch); NULL only on rows
+-- written before the column existed.
+-- rollout_id is the client-supplied x-weave-rollout-id correlation id used by
+-- eval/training harnesses to join graded rollout rewards onto decisions; NULL
+-- for all non-harness traffic.
+-- session_key + role are the offline join key to router.spiral_shadow_events
+-- and session_pins; NULL on rows written before the columns existed.
+-- fresh_decision_model + fresh_candidate_scores capture the scorer's fresh
+-- recommendation even on STAY turns (where decision_model names the pinned
+-- model served); pin_age_sec supports min-dwell analysis. Shadow-mode
+-- instrumentation for the hysteresis downgrade lever; NULL when the scorer did
+-- not run / no pin was loaded.
+-- credential_key_prefix + credential_key_suffix are the safe display parts of
+-- the upstream credential; credential_source names the precedence branch it came
+-- from. All NULL on deployment-key turns. Matching prefix/suffix values across
+-- distinct router_user_ids reveal one subscription paying for many seats.
+-- unified_limit_headers is the verbatim anthropic-ratelimit-unified-* header
+-- set observed on this turn (Claude Code cost-observing-proxy Phase 0
+-- instrumentation). NULL on non-subscription turns and on rows written before
+-- the column existed. Nothing reads it yet.
+-- name: InsertRequestTelemetry :exec
+INSERT INTO router.model_router_request_telemetry (
+    installation_id,
+    api_key_id,
+    request_id,
+    span_type,
+    trace_id,
+    timestamp,
+    requested_model,
+    decision_model,
+    decision_provider,
+    decision_reason,
+    estimated_input_tokens,
+    sticky_hit,
+    embed_input,
+    input_tokens,
+    output_tokens,
+    requested_input_cost_usd,
+    requested_output_cost_usd,
+    actual_input_cost_usd,
+    actual_output_cost_usd,
+    route_latency_ms,
+    upstream_latency_ms,
+    total_latency_ms,
+    cross_format,
+    upstream_status_code,
+    cluster_ids,
+    candidate_models,
+    chosen_score,
+    candidate_scores,
+    propensity,
+    alpha_breakdown,
+    cluster_router_version,
+    strategy,
+    route_id,
+    policy_route_key,
+    policy_artifact_id,
+    policy_artifact_sha256,
+    roster_version,
+    sidecar_schema_version,
+    training_allowed,
+    capture_mode,
+    debug_ref,
+    ttft_ms,
+    cache_creation_tokens,
+    cache_read_tokens,
+    device_id,
+    session_id,
+    router_user_id,
+    client_app,
+    turn_type,
+    rollout_id,
+    upstream_finish_reason,
+    stop_reason,
+    tool_use_blocks,
+    invalid_tool_args_blocks,
+    failover_used,
+    degenerate_shadow,
+    session_key,
+    role,
+    fresh_decision_model,
+    fresh_candidate_scores,
+    pin_age_sec,
+    tool_result_bytes,
+    credential_key_prefix,
+    credential_key_suffix,
+    credential_source,
+    unified_limit_headers
+) VALUES (
+    @installation_id::uuid,
+    sqlc.narg('api_key_id')::uuid,
+    @request_id::varchar,
+    @span_type::varchar,
+    @trace_id::varchar,
+    @timestamp::timestamptz,
+    @requested_model::varchar,
+    @decision_model::varchar,
+    @decision_provider::varchar,
+    @decision_reason::varchar,
+    @estimated_input_tokens::int,
+    @sticky_hit::boolean,
+    @embed_input::varchar,
+    @input_tokens::int,
+    @output_tokens::int,
+    @requested_input_cost_usd::bigint,
+    @requested_output_cost_usd::bigint,
+    @actual_input_cost_usd::bigint,
+    @actual_output_cost_usd::bigint,
+    @route_latency_ms::bigint,
+    @upstream_latency_ms::bigint,
+    @total_latency_ms::bigint,
+    @cross_format::boolean,
+    @upstream_status_code::int,
+    sqlc.narg('cluster_ids')::int[],
+    sqlc.narg('candidate_models')::text[],
+    sqlc.narg('chosen_score')::double precision,
+    sqlc.narg('candidate_scores')::jsonb,
+    sqlc.narg('propensity')::double precision,
+    sqlc.narg('alpha_breakdown')::jsonb,
+    sqlc.narg('cluster_router_version')::varchar,
+    sqlc.narg('strategy')::varchar,
+    sqlc.narg('route_id')::varchar,
+    sqlc.narg('policy_route_key')::varchar,
+    sqlc.narg('policy_artifact_id')::varchar,
+    sqlc.narg('policy_artifact_sha256')::varchar,
+    sqlc.narg('roster_version')::varchar,
+    sqlc.narg('sidecar_schema_version')::varchar,
+    @training_allowed::boolean,
+    @capture_mode::varchar,
+    sqlc.narg('debug_ref')::varchar,
+    sqlc.narg('ttft_ms')::bigint,
+    sqlc.narg('cache_creation_tokens')::int,
+    sqlc.narg('cache_read_tokens')::int,
+    sqlc.narg('device_id')::varchar,
+    sqlc.narg('session_id')::varchar,
+    sqlc.narg('router_user_id')::uuid,
+    sqlc.narg('client_app')::text,
+    @turn_type::varchar,
+    sqlc.narg('rollout_id')::varchar,
+    sqlc.narg('upstream_finish_reason')::text,
+    sqlc.narg('stop_reason')::text,
+    sqlc.narg('tool_use_blocks')::int,
+    sqlc.narg('invalid_tool_args_blocks')::int,
+    sqlc.narg('failover_used')::boolean,
+    sqlc.narg('degenerate_shadow')::boolean,
+    sqlc.narg('session_key')::bytea,
+    sqlc.narg('role')::varchar,
+    sqlc.narg('fresh_decision_model')::varchar,
+    sqlc.narg('fresh_candidate_scores')::jsonb,
+    sqlc.narg('pin_age_sec')::bigint,
+    sqlc.narg('tool_result_bytes')::int,
+    sqlc.narg('credential_key_prefix')::varchar,
+    sqlc.narg('credential_key_suffix')::varchar,
+    sqlc.narg('credential_source')::varchar,
+    sqlc.narg('unified_limit_headers')::jsonb
+)
+ON CONFLICT (installation_id, request_id, span_type) DO NOTHING;
+
+-- Returns the routing context for a single request, used to render the
+-- no-login feedback page (`/f/<token>`): which model/provider served the turn,
+-- the client app, when it was routed, and the router user. Only router.upstream
+-- rows are persisted, so the filter pins to that span type. Returns
+-- sql.ErrNoRows when the request id is unknown for the installation.
+-- name: GetRequestForFeedback :one
+SELECT
+    t.decision_model,
+    t.decision_provider,
+    t.client_app,
+    t.timestamp,
+    t.router_user_id
+FROM router.model_router_request_telemetry t
+WHERE t.installation_id = @installation_id::uuid
+  AND t.request_id = @request_id::varchar
+  AND t.span_type = 'router.upstream'
+ORDER BY t.timestamp DESC
+LIMIT 1;
+
+-- Returns aggregated cost and token totals across every installation.
+-- Used by admin-cookie sessions on the dashboard, which are not scoped to
+-- a single rk_ key.
+-- name: GetTelemetrySummaryAll :one
+SELECT
+    COUNT(*)::bigint                                            AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint     AS total_tokens,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS total_requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS total_actual_cost_usd,
+    COALESCE(SUM(
+        (requested_input_cost_usd + requested_output_cost_usd) -
+        (actual_input_cost_usd + actual_output_cost_usd)
+    ), 0)::bigint                                             AS total_savings_usd
+FROM router.model_router_request_telemetry
+WHERE span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz;
+
+-- Per-hour cost buckets across every installation. Admin-only.
+-- name: GetTelemetryTimeseriesHourlyAll :many
+SELECT
+    date_trunc('hour', timestamp)::timestamptz                                       AS bucket,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('hour', timestamp)
+ORDER BY bucket ASC;
+
+-- Per-day cost buckets across every installation. Admin-only.
+-- name: GetTelemetryTimeseriesDailyAll :many
+SELECT
+    date_trunc('day', timestamp)::timestamptz                                        AS bucket,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('day', timestamp)
+ORDER BY bucket ASC;
+
+-- Per-ISO-week cost buckets across every installation. Admin-only.
+-- name: GetTelemetryTimeseriesWeeklyAll :many
+SELECT
+    date_trunc('week', timestamp)::timestamptz                                       AS bucket,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('week', timestamp)
+ORDER BY bucket ASC;
+
+-- Returns aggregated cost and token totals for the dashboard cards.
+-- name: GetTelemetrySummary :one
+SELECT
+    COUNT(*)::bigint                                            AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint     AS total_tokens,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS total_requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS total_actual_cost_usd,
+    COALESCE(SUM(
+        (requested_input_cost_usd + requested_output_cost_usd) -
+        (actual_input_cost_usd + actual_output_cost_usd)
+    ), 0)::bigint                                             AS total_savings_usd
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz;
+
+-- Returns per-hour cost buckets for the cost savings chart.
+-- name: GetTelemetryTimeseriesHourly :many
+SELECT
+    date_trunc('hour', timestamp)::timestamptz                                       AS bucket,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('hour', timestamp)
+ORDER BY bucket ASC;
+
+-- Returns per-day cost buckets for the cost savings chart.
+-- name: GetTelemetryTimeseriesDaily :many
+SELECT
+    date_trunc('day', timestamp)::timestamptz                                        AS bucket,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('day', timestamp)
+ORDER BY bucket ASC;
+
+-- Returns per-ISO-week cost buckets for the cost savings chart.
+-- name: GetTelemetryTimeseriesWeekly :many
+SELECT
+    date_trunc('week', timestamp)::timestamptz                                       AS bucket,
+    COALESCE(SUM(requested_input_cost_usd + requested_output_cost_usd), 0)::bigint AS requested_cost_usd,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint       AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('week', timestamp)
+ORDER BY bucket ASC;
+
+-- Per-hour request/token/cost buckets grouped by the model the router
+-- selected, across every installation. Powers the dashboard's per-model
+-- usage and spend charts. Admin-only.
+-- name: GetTelemetryModelBreakdownHourlyAll :many
+SELECT
+    date_trunc('hour', timestamp)::timestamptz                               AS bucket,
+    COALESCE(decision_model, '')::varchar                                    AS decision_model,
+    COUNT(*)::bigint                                                          AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint                   AS total_tokens,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('hour', timestamp), COALESCE(decision_model, '')
+ORDER BY bucket ASC, decision_model ASC;
+
+-- Per-day request/token/cost buckets grouped by decision model, across
+-- every installation. Admin-only.
+-- name: GetTelemetryModelBreakdownDailyAll :many
+SELECT
+    date_trunc('day', timestamp)::timestamptz                                AS bucket,
+    COALESCE(decision_model, '')::varchar                                    AS decision_model,
+    COUNT(*)::bigint                                                          AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint                   AS total_tokens,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('day', timestamp), COALESCE(decision_model, '')
+ORDER BY bucket ASC, decision_model ASC;
+
+-- Per-ISO-week request/token/cost buckets grouped by decision model,
+-- across every installation. Admin-only.
+-- name: GetTelemetryModelBreakdownWeeklyAll :many
+SELECT
+    date_trunc('week', timestamp)::timestamptz                               AS bucket,
+    COALESCE(decision_model, '')::varchar                                    AS decision_model,
+    COUNT(*)::bigint                                                          AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint                   AS total_tokens,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('week', timestamp), COALESCE(decision_model, '')
+ORDER BY bucket ASC, decision_model ASC;
+
+-- Per-hour request/token/cost buckets grouped by decision model for one
+-- installation. Powers the dashboard's per-model usage and spend charts.
+-- name: GetTelemetryModelBreakdownHourly :many
+SELECT
+    date_trunc('hour', timestamp)::timestamptz                               AS bucket,
+    COALESCE(decision_model, '')::varchar                                    AS decision_model,
+    COUNT(*)::bigint                                                          AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint                   AS total_tokens,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('hour', timestamp), COALESCE(decision_model, '')
+ORDER BY bucket ASC, decision_model ASC;
+
+-- Per-day request/token/cost buckets grouped by decision model for one
+-- installation.
+-- name: GetTelemetryModelBreakdownDaily :many
+SELECT
+    date_trunc('day', timestamp)::timestamptz                                AS bucket,
+    COALESCE(decision_model, '')::varchar                                    AS decision_model,
+    COUNT(*)::bigint                                                          AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint                   AS total_tokens,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('day', timestamp), COALESCE(decision_model, '')
+ORDER BY bucket ASC, decision_model ASC;
+
+-- Per-ISO-week request/token/cost buckets grouped by decision model for
+-- one installation.
+-- name: GetTelemetryModelBreakdownWeekly :many
+SELECT
+    date_trunc('week', timestamp)::timestamptz                               AS bucket,
+    COALESCE(decision_model, '')::varchar                                    AS decision_model,
+    COUNT(*)::bigint                                                          AS request_count,
+    COALESCE(SUM(input_tokens + output_tokens), 0)::bigint                   AS total_tokens,
+    COALESCE(SUM(actual_input_cost_usd + actual_output_cost_usd), 0)::bigint AS actual_cost_usd
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND span_type = 'router.upstream'
+  AND timestamp >= @from_time::timestamptz
+  AND timestamp < @to_time::timestamptz
+GROUP BY date_trunc('week', timestamp), COALESCE(decision_model, '')
+ORDER BY bucket ASC, decision_model ASC;
+
+-- Returns individual telemetry rows for a time window. Used by the
+-- dashboard drill-down modal to show the underlying requests behind a
+-- chart bucket. Admin scope: spans every installation.
+-- name: GetTelemetryRowsAll :many
+SELECT
+    t.timestamp,
+    t.request_id,
+    t.requested_model,
+    t.decision_model,
+    t.decision_provider,
+    t.decision_reason,
+    t.sticky_hit,
+    t.input_tokens,
+    t.output_tokens,
+    t.cache_creation_tokens,
+    t.cache_read_tokens,
+    COALESCE(t.requested_input_cost_usd + t.requested_output_cost_usd, 0)::bigint AS requested_cost_usd,
+    COALESCE(t.actual_input_cost_usd + t.actual_output_cost_usd, 0)::bigint       AS actual_cost_usd,
+    t.total_latency_ms,
+    t.upstream_status_code,
+    t.router_user_id,
+    t.client_app,
+    COALESCE(t.turn_type, '')::varchar AS turn_type,
+    u.email AS user_email
+FROM router.model_router_request_telemetry t
+LEFT JOIN router.model_router_users u
+    ON u.id = t.router_user_id
+    AND u.deleted_at IS NULL
+WHERE t.span_type = 'router.upstream'
+  AND t.timestamp >= @from_time::timestamptz
+  AND t.timestamp < @to_time::timestamptz
+ORDER BY t.timestamp DESC
+LIMIT @row_limit::int;
+
+-- Returns individual telemetry rows scoped to a single installation.
+-- name: GetTelemetryRows :many
+SELECT
+    t.timestamp,
+    t.request_id,
+    t.requested_model,
+    t.decision_model,
+    t.decision_provider,
+    t.decision_reason,
+    t.sticky_hit,
+    t.input_tokens,
+    t.output_tokens,
+    t.cache_creation_tokens,
+    t.cache_read_tokens,
+    COALESCE(t.requested_input_cost_usd + t.requested_output_cost_usd, 0)::bigint AS requested_cost_usd,
+    COALESCE(t.actual_input_cost_usd + t.actual_output_cost_usd, 0)::bigint       AS actual_cost_usd,
+    t.total_latency_ms,
+    t.upstream_status_code,
+    t.router_user_id,
+    t.client_app,
+    COALESCE(t.turn_type, '')::varchar AS turn_type,
+    u.email AS user_email
+FROM router.model_router_request_telemetry t
+LEFT JOIN router.model_router_users u
+    ON u.id = t.router_user_id
+    AND u.deleted_at IS NULL
+WHERE t.installation_id = @installation_id::uuid
+  AND t.span_type = 'router.upstream'
+  AND t.timestamp >= @from_time::timestamptz
+  AND t.timestamp < @to_time::timestamptz
+ORDER BY t.timestamp DESC
+LIMIT @row_limit::int;
+
+-- Returns the Nth main_loop telemetry row for a (session_key, role) within
+-- an installation, ordered ascending by timestamp. seq is 1-based.
+-- request_id is the secondary sort key so the same query for the same input
+-- resolves to the same row across replicas (timestamp ties would otherwise
+-- make sequence assignment nondeterministic).
+-- name: GetTelemetryBySessionAsc :one
+SELECT
+    request_id,
+    decision_model,
+    decision_provider,
+    route_id,
+    strategy,
+    timestamp
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND session_key = @session_key::bytea
+  AND role = @role::varchar
+  AND turn_type = 'main_loop'
+  AND span_type = 'router.upstream'
+ORDER BY timestamp ASC, request_id ASC
+LIMIT 1 OFFSET @turn_offset::int;
+
+-- Returns the Nth-from-latest main_loop telemetry row for a (session_key, role)
+-- within an installation, ordered descending by timestamp. abs_seq is 1-based
+-- (1 = latest, 2 = one-before-latest, etc.). request_id is the secondary sort
+-- key so timestamp ties resolve deterministically.
+-- name: GetTelemetryBySessionDesc :one
+SELECT
+    request_id,
+    decision_model,
+    decision_provider,
+    route_id,
+    strategy,
+    timestamp
+FROM router.model_router_request_telemetry
+WHERE installation_id = @installation_id::uuid
+  AND session_key = @session_key::bytea
+  AND role = @role::varchar
+  AND turn_type = 'main_loop'
+  AND span_type = 'router.upstream'
+ORDER BY timestamp DESC, request_id DESC
+LIMIT 1 OFFSET @turn_offset::int;

@@ -1,0 +1,67 @@
+# Python
+__pycache__/
+*.pyc
+*.pyo
+.venv/
+*.egg-info/
+dist/
+
+# Node
+node_modules/
+
+# Go
+*.exe
+*.test
+*.out
+
+# ONNX / ML models (downloaded at setup time)
+*.onnx
+data/minilm/
+
+# Cached data (regeneratable)
+*.npy
+data/emb_*
+data/routerbench_0shot.pkl
+data/label_matrix.parquet
+data/labelcorpus.jsonl
+data/llm_scores_*.jsonl
+data/matrix/
+
+# Benchmark data (downloaded by setup script)
+router-bench/results/bench/
+router-bench/results/bench-release/
+router-v2/router-bench/results/bench/
+
+# User secrets
+.openrouter_key
+.env
+.env.local
+
+# IDE
+.idea/
+.vscode/
+*.swp
+*.swo
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Cache dirs
+.cache/
+*.db
+*.db-journal
+*.db-wal
+
+# Large pickle artifacts
+*.pkl
+
+# Router-specific build artifacts
+router/cmd/router/router
+router/assets/
+
+# Claude routerlab models (bundles are committed, ONNX models are not)
+claude/models/
+!claude/models/v*/
+!claude/models/latest
+claude/results/

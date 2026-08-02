@@ -1,0 +1,171 @@
+package proxy_test
+
+import (
+	"errors"
+	"fmt"
+	"net/http"
+	"testing"
+
+	"workweave/router/internal/billing"
+	"workweave/router/internal/providers"
+	"workweave/router/internal/proxy"
+	"workweave/router/internal/router/bandit"
+	"workweave/router/internal/router/cluster"
+	"workweave/router/internal/router/hmm"
+	"workweave/router/internal/router/rl"
+	"workweave/router/internal/translate"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+)
+
+func TestClassifyDispatchError_UnknownErrorIsUnmatched(t *testing.T) {
+	_, ok := proxy.ClassifyDispatchError(errors.New("boom"))
+	assert.False(t, ok, "an error not matching any known sentinel must not be classified")
+}
+
+func TestClassifyDispatchError_ProviderNotConfigured(t *testing.T) {
+	// This is the exact wrapping service.go's dispatch switch uses (fmt.Errorf("%w: %s", ErrProviderNotConfigured, name)).
+	err := fmt.Errorf("%w: %s", proxy.ErrProviderNotConfigured, "some-provider")
+
+	cls, ok := proxy.ClassifyDispatchError(err)
+
+	require.True(t, ok, "ErrProviderNotConfigured must be classified")
+	assert.Equal(t, proxy.DispatchErrorProviderNotConfigured, cls.Kind)
+	assert.Equal(t, http.StatusBadGateway, cls.Status)
+	assert.Equal(t, "Provider not configured.", cls.Message)
+	assert.False(t, cls.RetryAfter)
+	assert.False(t, cls.Kind.IsClientError(), "provider-not-configured is an upstream/routing problem, not a client-input one")
+}
+
+func TestClassifyDispatchError_UpstreamStatusErrorPreservesStatus(t *testing.T) {
+	err := &providers.UpstreamStatusError{Status: http.StatusTooManyRequests}
+
+	cls, ok := proxy.ClassifyDispatchError(err)
+
+	require.True(t, ok)
+	assert.Equal(t, proxy.DispatchErrorUpstreamStatus, cls.Kind)
+	assert.Equal(t, http.StatusTooManyRequests, cls.Status)
+}
+
+func TestClassifyDispatchError_ClusterUnavailableRetriesAndLogsError(t *testing.T) {
+	cls, ok := proxy.ClassifyDispatchError(cluster.ErrClusterUnavailable)
+
+	require.True(t, ok)
+	assert.Equal(t, http.StatusServiceUnavailable, cls.Status)
+	assert.True(t, cls.RetryAfter)
+	assert.Equal(t, "error", cls.LogLevel)
+}
+
+func TestClassifyDispatchError_NoEligibleProviderIsClientErrorAndWarns(t *testing.T) {
+	cls, ok := proxy.ClassifyDispatchError(cluster.ErrNoEligibleProvider)
+
+	require.True(t, ok)
+	assert.Equal(t, http.StatusBadRequest, cls.Status)
+	assert.True(t, cls.Kind.IsClientError())
+	assert.Equal(t, "warn", cls.LogLevel)
+	assert.False(t, cls.RetryAfter)
+}
+
+func TestClassifyDispatchError_BanditRLandHMMUnavailableRetry(t *testing.T) {
+	for _, err := range []error{bandit.ErrBanditUnavailable, rl.ErrPolicyUnavailable, hmm.ErrHMMUnavailable} {
+		cls, ok := proxy.ClassifyDispatchError(err)
+		require.True(t, ok, "expected %v to be classified", err)
+		assert.Equal(t, http.StatusServiceUnavailable, cls.Status)
+		assert.True(t, cls.RetryAfter)
+	}
+}
+
+func TestClassifyDispatchError_CreditsExhaustedIs402(t *testing.T) {
+	cls, ok := proxy.ClassifyDispatchError(proxy.ErrCreditsExhaustedSubscriptionUnavailable)
+
+	require.True(t, ok, "the credits-exhausted sentinel must be classified")
+	assert.Equal(t, proxy.DispatchErrorCreditsExhausted, cls.Kind)
+	assert.Equal(t, http.StatusPaymentRequired, cls.Status)
+	assert.Contains(t, cls.Message, "credits are exhausted", "the client message must explain the depleted balance")
+	assert.Contains(t, cls.Message, "router-credits", "the client message must surface the top-up CTA")
+	assert.Equal(t, "warn", cls.LogLevel)
+	assert.False(t, cls.RetryAfter, "a retry won't help until credits are added")
+}
+
+func TestClassifyDispatchError_NotImplementedDoesNotLog(t *testing.T) {
+	cls, ok := proxy.ClassifyDispatchError(providers.ErrNotImplemented)
+
+	require.True(t, ok)
+	assert.Equal(t, http.StatusNotImplemented, cls.Status)
+	assert.Empty(t, cls.LogLevel)
+}
+
+func TestClassifyDispatchError_TranslationIntrinsicIncompatibilityIs400(t *testing.T) {
+	cls, ok := proxy.ClassifyDispatchError(proxy.ErrTranslationIntrinsicallyIncompatible)
+
+	require.True(t, ok)
+	assert.Equal(t, proxy.DispatchErrorTranslationIntrinsicallyIncompatible, cls.Kind)
+	assert.Equal(t, http.StatusBadRequest, cls.Status)
+	assert.True(t, cls.Kind.IsClientError())
+	assert.False(t, cls.RetryAfter)
+}
+
+func TestClassifyDispatchError_TranslationCompatibleProviderUnavailableIs503(t *testing.T) {
+	cls, ok := proxy.ClassifyDispatchError(proxy.ErrTranslationCompatibleProviderUnavailable)
+
+	require.True(t, ok)
+	assert.Equal(t, proxy.DispatchErrorTranslationProviderUnavailable, cls.Kind)
+	assert.Equal(t, http.StatusServiceUnavailable, cls.Status)
+	assert.False(t, cls.Kind.IsClientError())
+	assert.True(t, cls.RetryAfter)
+}
+
+func TestClassifyDispatchError_UserSpendLimitReachedIs402(t *testing.T) {
+	err := fmt.Errorf("%w: spent 5 of 5 usd micros", billing.ErrUserMonthlySpendLimitReached)
+
+	cls, ok := proxy.ClassifyDispatchError(err)
+
+	require.True(t, ok)
+	assert.Equal(t, proxy.DispatchErrorUserSpendLimitReached, cls.Kind)
+	assert.Equal(t, http.StatusPaymentRequired, cls.Status)
+	assert.False(t, cls.RetryAfter)
+	assert.Equal(t, "warn", cls.LogLevel)
+	assert.False(t, cls.Kind.IsClientError())
+}
+
+func TestClassifyDispatchError_SpendLimitUnavailableFailsClosed503(t *testing.T) {
+	err := fmt.Errorf("%w: %v", billing.ErrSpendLimitCheckUnavailable, errors.New("pg down"))
+
+	cls, ok := proxy.ClassifyDispatchError(err)
+
+	require.True(t, ok)
+	assert.Equal(t, proxy.DispatchErrorSpendLimitUnavailable, cls.Kind)
+	assert.Equal(t, http.StatusServiceUnavailable, cls.Status)
+	assert.True(t, cls.RetryAfter)
+	assert.Equal(t, "error", cls.LogLevel)
+}
+
+func TestClassifyDispatchError_AnthropicCacheControlOverflowIs400(t *testing.T) {
+	// Mirror the wrapping service.go uses: fmt.Errorf("emit body: %w", emitErr).
+	err := fmt.Errorf("emit body: %w", fmt.Errorf("%w: got 5, maximum is 4", translate.ErrAnthropicCacheControlOverflow))
+
+	cls, ok := proxy.ClassifyDispatchError(err)
+
+	require.True(t, ok, "ErrAnthropicCacheControlOverflow must be classified, not fall through to a generic 502")
+	assert.Equal(t, proxy.DispatchErrorAnthropicCacheControlInvalid, cls.Kind)
+	assert.Equal(t, http.StatusBadRequest, cls.Status)
+	assert.True(t, cls.Kind.IsClientError(), "the client's own explicit breakpoints exceeded capacity, not an upstream/routing problem")
+	assert.Equal(t, "warn", cls.LogLevel)
+	assert.False(t, cls.RetryAfter)
+	assert.NotContains(t, cls.Message, "emit body:", "the internal wrap-chain prefix must not leak into the client-facing message")
+	assert.Contains(t, cls.Message, "got 5, maximum is 4", "the validator's dynamic detail must survive unwrapping")
+}
+
+func TestClassifyDispatchError_AnthropicCacheControlInvalidTTLOrderingIs400(t *testing.T) {
+	err := fmt.Errorf("emit body: %w", fmt.Errorf("%w: ttl=1h cache_control must not follow ttl=5m", translate.ErrAnthropicCacheControlInvalid))
+
+	cls, ok := proxy.ClassifyDispatchError(err)
+
+	require.True(t, ok)
+	assert.Equal(t, proxy.DispatchErrorAnthropicCacheControlInvalid, cls.Kind)
+	assert.Equal(t, http.StatusBadRequest, cls.Status)
+	assert.True(t, cls.Kind.IsClientError())
+	assert.NotContains(t, cls.Message, "emit body:", "the internal wrap-chain prefix must not leak into the client-facing message")
+	assert.Contains(t, cls.Message, "ttl=1h cache_control must not follow ttl=5m")
+}

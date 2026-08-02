@@ -1,0 +1,5 @@
+.openrouter_key
+data/
+results/
+.venv/
+__pycache__/

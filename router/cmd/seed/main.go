@@ -1,0 +1,168 @@
+// Command seed creates a local-dev installation and API key, then prints
+// the raw token and paste-ready configuration for Claude Code and Cursor.
+//
+// Usage:
+//
+//	go run ./cmd/seed
+//	# or via Makefile:
+//	make seed
+package main
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"os"
+	"time"
+
+	"workweave/router/internal/auth"
+	"workweave/router/internal/config"
+
+	"github.com/jackc/pgx/v5"
+)
+
+const (
+	// Seed into the admin installation so the seeded rk_... key (and any
+	// BYOK provider keys added through the dashboard) all live on the same
+	// installation. Using a separate "local-dev" installation made the
+	// seeded key invisible to the dashboard and made dashboard-added BYOK
+	// keys invisible to requests authenticated with the seeded token.
+	defaultOrgID = auth.AdminInstallationExternalID
+	defaultName  = auth.AdminInstallationName
+	createdBy    = "make seed"
+	baseURL      = "http://localhost:8080"
+)
+
+func main() {
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+
+	conn, err := pgx.Connect(ctx, config.PostgresDSN())
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot connect to postgres: %v\n", err)
+		os.Exit(1)
+	}
+	defer conn.Close(ctx)
+
+	if _, err := conn.Exec(ctx, "SET search_path TO router, public"); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot set search_path: %v\n", err)
+		os.Exit(1)
+	}
+
+	rawToken := auth.GenerateID(auth.APIKeyPrefix)
+	keyHash, keyPrefix, keySuffix := auth.APITokenFingerprint(rawToken)
+
+	tx, err := conn.Begin(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot begin transaction: %v\n", err)
+		os.Exit(1)
+	}
+	defer tx.Rollback(ctx) //nolint:errcheck
+
+	externalID := defaultOrgID
+	if v := os.Getenv("SEED_EXTERNAL_ID"); v != "" {
+		externalID = v
+	}
+
+	var installationID string
+	err = tx.QueryRow(ctx, `
+		INSERT INTO model_router_installations
+			(external_id, name, created_by)
+		VALUES (@external_id, @name, @created_by)
+		ON CONFLICT (external_id, name) WHERE deleted_at IS NULL DO NOTHING
+		RETURNING id::text`,
+		pgx.NamedArgs{
+			"external_id": externalID,
+			"name":        defaultName,
+			"created_by":  createdBy,
+		},
+	).Scan(&installationID)
+	if errors.Is(err, pgx.ErrNoRows) {
+		err = tx.QueryRow(ctx, `
+			SELECT id::text FROM model_router_installations
+			WHERE external_id = @external_id AND name = @name AND deleted_at IS NULL`,
+			pgx.NamedArgs{"external_id": externalID, "name": defaultName},
+		).Scan(&installationID)
+	}
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot create installation: %v\n", err)
+		os.Exit(1)
+	}
+
+	// One active key per installation (migration 0007). Soft-delete any
+	// existing key so re-running `make seed` rotates the local-dev token
+	// instead of erroring on the partial unique index.
+	if _, err := tx.Exec(ctx, `
+		UPDATE model_router_api_keys
+		SET deleted_at = CURRENT_TIMESTAMP
+		WHERE installation_id = @installation_id::uuid
+		  AND deleted_at IS NULL`,
+		pgx.NamedArgs{"installation_id": installationID},
+	); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot soft-delete existing API keys: %v\n", err)
+		os.Exit(1)
+	}
+
+	var apiKeyID string
+	err = tx.QueryRow(ctx, `
+		INSERT INTO model_router_api_keys
+			(installation_id, external_id, name,
+			 key_prefix, key_hash, key_suffix, created_by)
+		VALUES (@installation_id::uuid, @external_id, @name,
+				@key_prefix, @key_hash, @key_suffix, @created_by)
+		RETURNING id::text`,
+		pgx.NamedArgs{
+			"installation_id": installationID,
+			"external_id":     externalID,
+			"name":            defaultName,
+			"key_prefix":      keyPrefix,
+			"key_hash":        keyHash,
+			"key_suffix":      keySuffix,
+			"created_by":      createdBy,
+		},
+	).Scan(&apiKeyID)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot create API key: %v\n", err)
+		os.Exit(1)
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		fmt.Fprintf(os.Stderr, "Error: cannot commit transaction: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Printf("Created installation %s (external_id: %s)\n", installationID, externalID)
+	fmt.Printf("Created API key      %s (suffix: ...%s)\n\n", apiKeyID, keySuffix)
+	fmt.Printf("Weave Router key (shown once — store it now):\n")
+	fmt.Printf("  %s\n\n", rawToken)
+	fmt.Printf("This is a Weave Router auth token (rk_...) — it gates traffic to your\n")
+	fmt.Printf("router. It is NOT an Anthropic key. Anthropic only sees the upstream\n")
+	fmt.Printf("provider key (sk-ant-...) the router holds server-side.\n\n")
+
+	fmt.Printf("Quick smoke test:\n")
+	fmt.Printf("  curl -i -H 'Authorization: Bearer %s' %s/validate\n\n", rawToken, baseURL)
+
+	fmt.Printf("=== Claude Code (recommended) ===\n")
+	fmt.Printf("  export WEAVE_ROUTER_KEY=%s\n", rawToken)
+	fmt.Printf("  ./install/install.sh --base-url %s\n", baseURL)
+	fmt.Printf("  claude  # The installer wires settings.json — no shell exports needed afterwards\n\n")
+
+	fmt.Printf("=== Claude Code (manual fallback) ===\n")
+	fmt.Printf("  Keep Claude Code's Anthropic auth unchanged; send the router key\n")
+	fmt.Printf("  in a router-only custom header.\n")
+	fmt.Printf("    export ANTHROPIC_BASE_URL=%s\n", baseURL)
+	fmt.Printf("    export ANTHROPIC_CUSTOM_HEADERS='X-Weave-Router-Key: %s'\n", rawToken)
+	fmt.Printf("    claude\n\n")
+
+	fmt.Printf("=== Codex ===\n")
+	fmt.Printf("  Keep Codex's OpenAI auth unchanged; send the router key\n")
+	fmt.Printf("  in a router-only custom header.\n")
+	fmt.Printf("    export OPENAI_BASE_URL=%s/v1\n", baseURL)
+	fmt.Printf("    export OPENAI_EXTRA_HEADERS='X-Weave-Router-Key: %s'\n", rawToken)
+	fmt.Printf("    codex\n\n")
+
+	fmt.Printf("=== Cursor ===\n")
+	fmt.Printf("  1. Open Cursor Settings > Models > Override OpenAI Base URL\n")
+	fmt.Printf("     Set to: %s/v1\n", baseURL)
+	fmt.Printf("  2. Paste the Weave Router key as the API key: %s\n", rawToken)
+}

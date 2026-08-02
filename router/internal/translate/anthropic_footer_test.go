@@ -1,0 +1,160 @@
+package translate_test
+
+import (
+	"net/http"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"workweave/router/internal/translate"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+)
+
+const testFooter = "\n\n_Weave Router feedback:_ `/rf +` good experience · `/rf -` poor experience · note optional, e.g. `/rf - too slow`"
+
+// anthropicAnswerStream is a minimal text answer (index 0) that ends naturally.
+func anthropicAnswerStream(stopReason string) string {
+	return buildAnthropicSSE("message_start", `{"type":"message_start","message":{"id":"msg_1","type":"message","role":"assistant","content":[],"model":"claude-opus-4","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}`) +
+		buildAnthropicSSE("content_block_start", `{"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}`) +
+		buildAnthropicSSE("content_block_delta", `{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"The answer is 42."}}`) +
+		buildAnthropicSSE("content_block_stop", `{"type":"content_block_stop","index":0}`) +
+		buildAnthropicSSE("message_delta", `{"type":"message_delta","delta":{"stop_reason":"`+stopReason+`","stop_sequence":null},"usage":{"output_tokens":10}}`) +
+		buildAnthropicSSE("message_stop", `{"type":"message_stop"}`)
+}
+
+func TestAnthropicRoutingFooterWriter_InjectsBeforeMessageDelta(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewAnthropicRoutingFooterWriter(rec, testFooter)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	_, err := w.Write([]byte(anthropicAnswerStream("end_turn")))
+	require.NoError(t, err)
+
+	events := splitSSEEvents(rec.Body.String())
+	// 6 upstream events + 1 injected footer text_delta = 7. The footer folds
+	// into the existing answer block, so no new content_block_start/stop pair.
+	require.Len(t, events, 7)
+
+	// Locate the footer text_delta, the answer block's content_block_stop, and
+	// the message_delta. The footer must land before both.
+	footerIdx, stopIdx, msgDeltaIdx := -1, -1, -1
+	for i, e := range events {
+		data := extractDataField(e)
+		typ := gjson.Get(data, "type").String()
+		switch typ {
+		case "content_block_delta":
+			if strings.Contains(gjson.Get(data, "delta.text").String(), "Weave Router feedback") {
+				footerIdx = i
+				assert.EqualValues(t, 0, gjson.Get(data, "index").Int(),
+					"footer must fold into the answer block (index 0), not a new block")
+			}
+		case "content_block_stop":
+			stopIdx = i
+		case "message_delta":
+			msgDeltaIdx = i
+		}
+	}
+	require.NotEqual(t, -1, footerIdx, "footer text_delta must be present")
+	require.NotEqual(t, -1, stopIdx, "content_block_stop must be present")
+	require.NotEqual(t, -1, msgDeltaIdx, "message_delta must be present")
+	assert.Less(t, footerIdx, stopIdx, "footer must precede the answer block's content_block_stop")
+	assert.Less(t, footerIdx, msgDeltaIdx, "footer must be injected before message_delta")
+}
+
+// TestAnthropicRoutingFooterWriter_FoldsIntoFinalTextBlock pins the Conductor
+// regression: the footer must share the final answer block's index rather than
+// arrive as a standalone trailing block. Clients that render only the last
+// content block (Conductor and other Claude Code wrappers) would otherwise show
+// the rating prompt as the entire message and bury the answer in the trace.
+func TestAnthropicRoutingFooterWriter_FoldsIntoFinalTextBlock(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewAnthropicRoutingFooterWriter(rec, testFooter)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	_, err := w.Write([]byte(anthropicAnswerStream("end_turn")))
+	require.NoError(t, err)
+
+	for _, e := range splitSSEEvents(rec.Body.String()) {
+		data := extractDataField(e)
+		// No content block beyond the original answer block (index 0) may exist.
+		if strings.HasPrefix(gjson.Get(data, "type").String(), "content_block_") {
+			assert.EqualValues(t, 0, gjson.Get(data, "index").Int(),
+				"no content block may be added beyond the answer block (index 0)")
+		}
+	}
+}
+
+func TestAnthropicRoutingFooterWriter_SkipsToolUseTurn(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewAnthropicRoutingFooterWriter(rec, testFooter)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	_, err := w.Write([]byte(anthropicAnswerStream("tool_use")))
+	require.NoError(t, err)
+
+	assert.NotContains(t, rec.Body.String(), "Weave Router feedback", "tool_use turns must not get a footer")
+}
+
+func TestAnthropicRoutingFooterWriter_EmptyFooterPassthrough(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewAnthropicRoutingFooterWriter(rec, "")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	in := anthropicAnswerStream("end_turn")
+	_, err := w.Write([]byte(in))
+	require.NoError(t, err)
+	assert.Equal(t, in, rec.Body.String(), "empty footer must be byte-identical passthrough")
+}
+
+func TestAnthropicRoutingFooterWriter_NonStreamingPassthrough(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewAnthropicRoutingFooterWriter(rec, testFooter)
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(http.StatusOK)
+
+	body := `{"id":"msg_1","content":[{"type":"text","text":"Hi"}]}`
+	_, err := w.Write([]byte(body))
+	require.NoError(t, err)
+	assert.Equal(t, body, rec.Body.String(), "non-streaming must pass through unmodified")
+}
+
+func TestAnthropicRoutingFooterWriter_NoContentNoFooter(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewAnthropicRoutingFooterWriter(rec, testFooter)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	// message_start then message_delta(end_turn) with no content block at all.
+	in := buildAnthropicSSE("message_start", `{"type":"message_start","message":{"id":"m","type":"message","role":"assistant","content":[],"model":"x","stop_reason":null,"usage":{"input_tokens":1,"output_tokens":0}}}`) +
+		buildAnthropicSSE("message_delta", `{"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":0}}`) +
+		buildAnthropicSSE("message_stop", `{"type":"message_stop"}`)
+	_, err := w.Write([]byte(in))
+	require.NoError(t, err)
+	assert.NotContains(t, rec.Body.String(), "Weave Router feedback", "no content block means nothing to rate")
+}
+
+func TestAnthropicRoutingFooterWriter_EventSplitAcrossWrites(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewAnthropicRoutingFooterWriter(rec, testFooter)
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(http.StatusOK)
+
+	full := anthropicAnswerStream("end_turn")
+	mid := len(full) / 2
+	_, err := w.Write([]byte(full[:mid]))
+	require.NoError(t, err)
+	_, err = w.Write([]byte(full[mid:]))
+	require.NoError(t, err)
+
+	body := rec.Body.String()
+	assert.Contains(t, body, "Weave Router feedback", "split stream must still get a footer")
+	// Footer must appear exactly once.
+	assert.Equal(t, 1, strings.Count(body, "Weave Router feedback"))
+}

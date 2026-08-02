@@ -1,0 +1,16 @@
+[project]
+name = "claude"
+version = "0.1.0"
+description = "Add your description here"
+requires-python = ">=3.12"
+dependencies = [
+    "httpx>=0.28.1",
+    "matplotlib>=3.11.1",
+    "numpy>=2.5.1",
+    "onnxruntime>=1.28.0",
+    "pandas>=3.0.5",
+    "pyarrow>=25.0.0",
+    "pytest>=9.1.1",
+    "scikit-learn>=1.9.0",
+    "tokenizers>=0.23.1",
+]

@@ -1,0 +1,536 @@
+#!/usr/bin/env bash
+#
+# Claude Code statusline for the Weave Router. CC pipes a JSON blob on stdin
+# whose `transcript_path` points at the JSONL log of the current session and
+# whose `model.display_name` is the user's CC-side model selection. The
+# router rewrites each request's `model` field before forwarding, so
+# Anthropic/OpenAI/Google return `message.model = <routed>` in the SSE
+# stream and CC stores that in the transcript verbatim. Per-turn savings
+# come from comparing each turn's routed cost against what the user's
+# selection would have cost on the same tokens. Works identically for
+# local docker and the managed cloud router — no sidecar, no DB, no auth.
+#
+# Wire up by adding to ~/.claude/settings.json:
+#   { "statusLine": { "type": "command", "command": "/abs/path/to/cc-statusline.sh" } }
+#
+# Renders:
+#   WEAVE ROUTER — claude-sonnet-4-5 ← claude-opus-4-7 · saved $1.23 · 12.4k in / 3.1k out / 45.2k cached
+#
+# Pricing source of truth: router/eval/pricing.py. Keep these maps in lockstep
+# when prices change. Cache multipliers (1.25× / 0.1×) follow Anthropic's
+# published cache pricing and are stable across the Claude family.
+
+set -euo pipefail
+
+# ---------- background self-refresh ----------
+#
+# Once every WEAVE_STATUSLINE_UPDATE_INTERVAL_DAYS (default 7), check
+# raw.githubusercontent.com for a newer copy of this script and swap it in
+# atomically. Runs in a forked subshell so the current Claude turn never
+# blocks; the next turn picks up the new version. Applies to both user-scope
+# (~/.weave/cc-statusline.sh) and project-scope (<repo>/.claude/cc-statusline.sh)
+# installs — project teammates rate-limit independently because the stamp
+# lives in their per-user cache dir, and on no-content-change days we skip
+# the mv entirely so the repo working tree stays clean. When upstream does
+# change, the first teammate's commit propagates the new version to the rest.
+# A pricing-table miss also triggers a refresh off-schedule — see
+# weave_refresh_on_price_miss below.
+#
+# Opt out entirely with `export WEAVE_STATUSLINE_UPDATE=0`. Override the
+# source with `WEAVE_STATUSLINE_URL=...`, e.g. for self-hosters who fork.
+#
+# $1 is an optional stamp suffix, so a caller refreshing for a reason other than
+# "the interval elapsed" rate-limits on its own clock rather than sharing the
+# periodic check's budget. $2=1 drops the stamp again if the download fails, for
+# callers recovering from a known-bad state where waiting out the full interval
+# on a transient network error is worse than retrying next turn.
+weave_self_refresh() {
+  local stamp_suffix="${1:-}"
+  local retry_on_fail="${2:-0}"
+
+  [ "${WEAVE_STATUSLINE_UPDATE:-1}" = "0" ] && return 0
+  command -v curl >/dev/null 2>&1 || return 0
+
+  local self="${BASH_SOURCE[0]:-$0}"
+  [ -f "$self" ] && [ -w "$self" ] || return 0
+
+  local interval_days="${WEAVE_STATUSLINE_UPDATE_INTERVAL_DAYS:-7}"
+  local interval_seconds=$(( interval_days * 86400 ))
+
+  # Stamp lives in the per-user cache dir, keyed by absolute script path so
+  # multiple repos (and the user-scope copy) rate-limit independently and no
+  # stray file ever lands inside a repo working tree.
+  local cache_dir="${XDG_CACHE_HOME:-$HOME/.cache}/weave-router"
+  mkdir -p "$cache_dir" 2>/dev/null || return 0
+  local script_slug
+  script_slug="$(printf '%s' "$self" | tr -c 'A-Za-z0-9._-' '_')"
+  local stamp="$cache_dir/checked-at${script_slug}${stamp_suffix}"
+
+  local now stamp_mtime
+  now="$(date +%s 2>/dev/null)" || return 0
+  if [ -f "$stamp" ]; then
+    # Try GNU `stat -c %Y` first; on macOS (BSD stat) -c isn't recognized
+    # and exits non-zero, so we fall through to `stat -f %m`. The reverse
+    # order is broken: GNU `stat -f` is `--file-system`, which silently
+    # succeeds with multi-line filesystem info instead of failing, leaving
+    # $stamp_mtime as garbage and disabling the rate-limit check entirely.
+    stamp_mtime="$(stat -c %Y "$stamp" 2>/dev/null || stat -f %m "$stamp" 2>/dev/null)" || stamp_mtime=0
+  else
+    stamp_mtime=0
+  fi
+  if [ -n "${stamp_mtime:-}" ] && [ "$stamp_mtime" -gt 0 ] \
+     && [ $(( now - stamp_mtime )) -lt "$interval_seconds" ]; then
+    return 0
+  fi
+
+  # Touch the stamp BEFORE forking so concurrent statusline invocations
+  # (Claude calls us on every turn) don't all kick off downloads.
+  : > "$stamp" 2>/dev/null || return 0
+
+  local url="${WEAVE_STATUSLINE_URL:-https://raw.githubusercontent.com/workweave/router/main/install/cc-statusline.sh}"
+  # $$ alone is not unique: two calls can run in one invocation (the periodic
+  # check and a pricing-miss retry both fire on a cold cache) and would then
+  # curl -o into the same path and mv over each other, installing a truncated
+  # script that can never self-heal. The stamp suffix is the right key — it is
+  # what makes two callers mutually exclusive in the first place, so callers
+  # that could overlap necessarily have different suffixes.
+  local tmp="${self}.tmp.$$${stamp_suffix}"
+  (
+    # Detach stdin (CC pipes JSON to us) so curl can't accidentally consume
+    # it, and silence all output so nothing leaks into the statusline.
+    exec </dev/null
+    if curl -fsSL --max-time 15 "$url" -o "$tmp" 2>/dev/null \
+       && [ -s "$tmp" ] \
+       && head -n 1 "$tmp" | grep -q '^#!.*bash' \
+       && [ "$(wc -c < "$tmp")" -ge 1024 ]; then
+      # No-op when the download matches what's already on disk — keeps git
+      # status clean for project-scope teammates during a routine refresh.
+      if cmp -s "$tmp" "$self"; then
+        rm -f "$tmp"
+      else
+        chmod +x "$tmp" 2>/dev/null || true
+        mv "$tmp" "$self" 2>/dev/null || rm -f "$tmp"
+      fi
+    else
+      rm -f "$tmp"
+      # A download that never landed shouldn't spend the caller's whole
+      # interval; drop the stamp so the next turn can try again.
+      if [ "$retry_on_fail" = "1" ]; then
+        rm -f "$stamp"
+      fi
+    fi
+  ) >/dev/null 2>&1 &
+  disown 2>/dev/null || true
+  return 0
+}
+weave_self_refresh 2>/dev/null || true
+
+input="$(cat)"
+transcript_path="$(printf '%s' "$input" | jq -r '.transcript_path // empty')"
+# Prefer model.id over display_name: pricing keys + the routed model id in
+# the transcript are canonical ids (e.g. claude-opus-4-7), while display_name
+# is a human label ("Opus 4.7 (1M context)") that won't hit the pricing table,
+# zeroing out savings. id passes through normalize_model cleanly.
+selected_display="$(printf '%s' "$input" | jq -r '.model.id // .model.display_name // "?"')"
+
+# Normalize a model id to a pricing-table key. CC + the decisions log carry
+# two flavors of annotation we don't want in the lookup:
+#   * date suffix:    claude-opus-4-7-20260101  → claude-opus-4-7
+#   * variant tag:    claude-opus-4-7[1m]       → claude-opus-4-7
+# The 1M-context variant prices ~2× base for prompts >200k tokens, but for
+# the "saved $X vs your selection" UX the base rate is the right comparison
+# — we're measuring the model swap, not the context tier. Used below on the
+# routed and requested model ids from the decisions log / transcript.
+normalize_model() {
+  printf '%s' "$1" | sed -E 's/\[[^]]*\]$//; s/-[0-9]{8}$//'
+}
+
+# USD per 1k tokens. Generated from internal/observability/otel/pricing.go
+# (USD/1M there, ÷1000 here) by cmd/genprices. Do not hand-edit — run
+# `make generate` after updating pricing.go.
+# BEGIN_GENERATED_PRICES
+prices='{
+  "input": {
+    "claude-fable-5":                   0.01,
+    "claude-haiku-4-5":                 0.001,
+    "claude-opus-4-0":                  0.015,
+    "claude-opus-4-1":                  0.015,
+    "claude-opus-4-5":                  0.005,
+    "claude-opus-4-6":                  0.005,
+    "claude-opus-4-7":                  0.005,
+    "claude-opus-4-8":                  0.005,
+    "claude-opus-5":                    0.005,
+    "claude-sonnet-4-5":                0.003,
+    "claude-sonnet-4-6":                0.003,
+    "claude-sonnet-5":                  0.003,
+    "deepseek/deepseek-v4-flash":       0.0001134,
+    "deepseek/deepseek-v4-pro":         0.001318,
+    "gemini-2.0-flash":                 0.0001,
+    "gemini-2.0-flash-lite":            0.000075,
+    "gemini-2.5-flash":                 0.0003,
+    "gemini-2.5-flash-lite":            0.0001,
+    "gemini-2.5-pro":                   0.00125,
+    "gemini-3-flash-preview":           0.0005,
+    "gemini-3-pro-preview":             0.002,
+    "gemini-3.1-flash-lite-preview":    0.0001,
+    "gemini-3.1-pro-preview":           0.002,
+    "gemini-3.5-flash":                 0.0015,
+    "gemini-3.5-flash-lite":            0.0003,
+    "gemini-3.6-flash":                 0.0015,
+    "google/gemma-4-26b-a4b-it":        0.00015,
+    "gpt-4.1":                          0.002,
+    "gpt-4.1-mini":                     0.0004,
+    "gpt-4.1-nano":                     0.0001,
+    "gpt-4o":                           0.0025,
+    "gpt-4o-mini":                      0.00015,
+    "gpt-5":                            0.0025,
+    "gpt-5-chat":                       0.0025,
+    "gpt-5-mini":                       0.0005,
+    "gpt-5-nano":                       0.0001,
+    "gpt-5.4":                          0.0025,
+    "gpt-5.4-mini":                     0.00075,
+    "gpt-5.4-nano":                     0.0002,
+    "gpt-5.4-pro":                      0.03,
+    "gpt-5.5":                          0.005,
+    "gpt-5.5-mini":                     0.0005,
+    "gpt-5.5-nano":                     0.00015,
+    "gpt-5.5-pro":                      0.03,
+    "gpt-5.6-luna":                     0.001,
+    "gpt-5.6-sol":                      0.005,
+    "gpt-5.6-terra":                    0.0025,
+    "grok-4.5":                         0.002,
+    "minimax/minimax-m2.7":             0.0003,
+    "minimax/minimax-m3":               0.0003,
+    "mistralai/mistral-small-2603":     0.0002,
+    "moonshotai/kimi-k2.5":             0.0006,
+    "moonshotai/kimi-k2.6":             0.00095,
+    "moonshotai/kimi-k2.7":             0.00095,
+    "moonshotai/kimi-k3":               0.003,
+    "qwen/qwen3-235b-a22b-2507":        0.0002266,
+    "qwen/qwen3-30b-a3b-instruct-2507": 0.00015,
+    "qwen/qwen3-coder":                 0.0009,
+    "qwen/qwen3-coder-next":            0.0005,
+    "qwen/qwen3-next-80b-a3b-instruct": 0.00015,
+    "qwen/qwen3.5-flash-02-23":         0.00005,
+    "qwen/qwen3.6-35b-a3b":             0.000172,
+    "qwen/qwen3.7-plus":                0.0004,
+    "xiaomi/mimo-v2.5-pro":             0.001,
+    "z-ai/glm-5":                       0.001,
+    "z-ai/glm-5.1":                     0.0014,
+    "z-ai/glm-5.2":                     0.0014
+  },
+  "output": {
+    "claude-fable-5":                   0.05,
+    "claude-haiku-4-5":                 0.005,
+    "claude-opus-4-0":                  0.075,
+    "claude-opus-4-1":                  0.075,
+    "claude-opus-4-5":                  0.025,
+    "claude-opus-4-6":                  0.025,
+    "claude-opus-4-7":                  0.025,
+    "claude-opus-4-8":                  0.025,
+    "claude-opus-5":                    0.025,
+    "claude-sonnet-4-5":                0.015,
+    "claude-sonnet-4-6":                0.015,
+    "claude-sonnet-5":                  0.015,
+    "deepseek/deepseek-v4-flash":       0.0002791,
+    "deepseek/deepseek-v4-pro":         0.0026361,
+    "gemini-2.0-flash":                 0.0004,
+    "gemini-2.0-flash-lite":            0.0003,
+    "gemini-2.5-flash":                 0.0012,
+    "gemini-2.5-flash-lite":            0.0004,
+    "gemini-2.5-pro":                   0.005,
+    "gemini-3-flash-preview":           0.002,
+    "gemini-3-pro-preview":             0.008,
+    "gemini-3.1-flash-lite-preview":    0.0004,
+    "gemini-3.1-pro-preview":           0.008,
+    "gemini-3.5-flash":                 0.009,
+    "gemini-3.5-flash-lite":            0.0025,
+    "gemini-3.6-flash":                 0.0075,
+    "google/gemma-4-26b-a4b-it":        0.0006,
+    "gpt-4.1":                          0.008,
+    "gpt-4.1-mini":                     0.0016,
+    "gpt-4.1-nano":                     0.0004,
+    "gpt-4o":                           0.01,
+    "gpt-4o-mini":                      0.0006,
+    "gpt-5":                            0.01,
+    "gpt-5-chat":                       0.01,
+    "gpt-5-mini":                       0.002,
+    "gpt-5-nano":                       0.0004,
+    "gpt-5.4":                          0.015,
+    "gpt-5.4-mini":                     0.0045,
+    "gpt-5.4-nano":                     0.00125,
+    "gpt-5.4-pro":                      0.18,
+    "gpt-5.5":                          0.03,
+    "gpt-5.5-mini":                     0.0025,
+    "gpt-5.5-nano":                     0.0006,
+    "gpt-5.5-pro":                      0.18,
+    "gpt-5.6-luna":                     0.006,
+    "gpt-5.6-sol":                      0.03,
+    "gpt-5.6-terra":                    0.015,
+    "grok-4.5":                         0.006,
+    "minimax/minimax-m2.7":             0.0012,
+    "minimax/minimax-m3":               0.0012,
+    "mistralai/mistral-small-2603":     0.0006,
+    "moonshotai/kimi-k2.5":             0.003,
+    "moonshotai/kimi-k2.6":             0.004,
+    "moonshotai/kimi-k2.7":             0.004,
+    "moonshotai/kimi-k3":               0.015,
+    "qwen/qwen3-235b-a22b-2507":        0.0009064,
+    "qwen/qwen3-30b-a3b-instruct-2507": 0.0006,
+    "qwen/qwen3-coder":                 0.0027,
+    "qwen/qwen3-coder-next":            0.0012,
+    "qwen/qwen3-next-80b-a3b-instruct": 0.0012,
+    "qwen/qwen3.5-flash-02-23":         0.00015,
+    "qwen/qwen3.6-35b-a3b":             0.0012002,
+    "qwen/qwen3.7-plus":                0.0016,
+    "xiaomi/mimo-v2.5-pro":             0.003,
+    "z-ai/glm-5":                       0.0032,
+    "z-ai/glm-5.1":                     0.0044,
+    "z-ai/glm-5.2":                     0.0044
+  }
+}'
+# END_GENERATED_PRICES
+
+routed=""
+forced="false"
+forced_model=""
+session_savings=""
+tot_in=0
+tot_out=0
+tot_cache_read=0
+tot_cache_write=0
+
+# Per-turn savings compare each turn's routed cost (priced from
+# message.model in the transcript) against what the CC-side model selection
+# (selected_display) would have cost on the same tokens. The selection
+# isn't strictly the per-turn "requested" model — CC tags some background
+# side-calls (compaction probes, title-gen) with a different model id —
+# but for those the planner short-circuits to a hard pin and the savings
+# math zeroes out anyway. Turns where routed == selection or where either
+# model isn't in the pricing table emit 0 savings; the tokens clause
+# always renders.
+
+# Normalize the CC-side selection once for use in the jq math below.
+requested_norm="$(normalize_model "$selected_display")"
+
+if [[ -n "$transcript_path" && -f "$transcript_path" ]]; then
+  # macOS ships `tail -r`, GNU coreutils ships `tac`. Either works to walk the
+  # JSONL in reverse so we can grab the latest assistant turn.
+  if command -v tac >/dev/null 2>&1; then reverse=(tac); else reverse=(tail -r); fi
+
+  # CC stamps message.model = "<synthetic>" on assistant turns it generated
+  # locally (errored requests, cancellations, tool-only stubs) instead of a
+  # real model id. Show that as "failure" rather than leaking the internal
+  # sentinel into the statusline.
+  routed="$("${reverse[@]}" "$transcript_path" 2>/dev/null \
+    | jq -r 'select(.type=="assistant") | .message.model // empty' \
+    | head -n 1 || true)"
+  if [[ "$routed" == "<synthetic>" ]]; then
+    routed="failure"
+  else
+    routed="$(normalize_model "$routed")"
+  fi
+
+  # Detect an active /force-model pin from the router's synthetic ack turns —
+  # the only turns stamped message.model == "weave-router". The router emits
+  # one whenever a pin changes state:
+  #   * /force-model              → "force-model applied: <model> (<provider>) …"
+  #   * /unforce-model            → "force-model cleared …"
+  #   * loop / no-progress break  → "… clearing the session pin …" (expires the
+  #                                  pin, including a user-forced one)
+  #   * unrecognized model        → "… isn't a recognized model · keeping
+  #                                  automatic routing" — a NO-OP: the prior
+  #                                  pin, if any, is left untouched
+  # These persist on disk (the ingress stripper only scrubs them from upstream
+  # requests). Classify each weave-router turn newest-first, skip the no-op
+  # "rejected" acks, and let the latest real state change decide: an "applied"
+  # marker means the session is pinned (and names the model); anything else
+  # (cleared / loop-break / no-progress) means automatic routing has resumed.
+  # Restricting to weave-router turns keeps a normal reply that merely quotes
+  # these phrases from flipping the tag. (A silent server-side TTL expiry emits
+  # no turn and so can't be reflected here — the pin TTL outlives a session.)
+  force_state="$("${reverse[@]}" "$transcript_path" 2>/dev/null \
+    | jq -r 'select(.type=="assistant" and .message.model=="weave-router")
+        | ([.message.content[]? | select(.type? == "text") | .text] | join(" ") | gsub("[\n\r]"; " ")) as $t
+        | if ($t | test("force-model applied:")) then "APPLIED " + ($t | capture("force-model applied: (?<m>[^ ]+)").m)
+          elif ($t | test("isn.t a recognized model")) then "REJECTED"
+          else "CLEARED" end' 2>/dev/null \
+    | grep -m1 -v '^REJECTED$' || true)"
+  if [[ "$force_state" == APPLIED\ * ]]; then
+    forced="true"
+    forced_model="${force_state#APPLIED }"
+  fi
+
+  # Compute a session running total: savings across every assistant turn
+  # whose marker reports a requested ≠ routed swap, plus cumulative token
+  # counts across every assistant turn (rerouted or not — total work the
+  # session has done). cache_creation is priced at 1.25× input, cache_read
+  # at 0.1× — both ratios are stable across the Claude family and a no-op
+  # when the provider doesn't return those fields. Cache reads ARE included
+  # in the savings comparison: both costs apply the same 0.1× weight to
+  # cache_read_input_tokens, so the delta reflects the model-price
+  # difference on the cached portion as well.
+  #
+  # The marker regex tolerates the optional "(<provider>)" segment and a
+  # `[1m]` / `-YYYYMMDD` suffix on either model name so transcripts written
+  # against context-tiered or dated model ids still parse cleanly.
+  #
+  # Dedup note: CC writes one JSONL entry per *content block* in an
+  # assistant turn (text, text, tool_use → 3 entries), and every entry
+  # carries the same `message.usage`. Summing per-entry triple-counts the
+  # turn. We dedupe on (message.id, message.usage) before summing:
+  #   * For native Anthropic upstreams message.id is unique per turn, so
+  #     this collapses the content-block fan-out cleanly.
+  #   * For non-Anthropic upstreams that round-trip through the router's
+  #     translator, message.id can be a constant placeholder
+  #     ("msg_translated"); usage still differs per turn (input_tokens
+  #     grows), so the composite key keeps turns distinct. Two turns with
+  #     byte-identical id AND usage would still collapse, but that's a
+  #     genuine retry/duplicate we want to drop.
+  read -r session_savings tot_in tot_out tot_cache_read tot_cache_write < <(
+    jq -rs --argjson p "$prices" --arg requested "$requested_norm" '
+      [.[] | select(.type=="assistant")] |
+      unique_by([.message.id, .message.usage]) |
+      .[] |
+      .message as $m |
+      ($m.model // "" | sub("\\[[^]]*\\]$"; "") | sub("-[0-9]{8}$"; "")) as $rm |
+      {
+        in:    ($m.usage.input_tokens // 0),
+        out:   ($m.usage.output_tokens // 0),
+        cwrt:  ($m.usage.cache_creation_input_tokens // 0),
+        crd:   ($m.usage.cache_read_input_tokens // 0)
+      } as $t |
+      (if $requested == "" or $requested == $rm then 0
+       else
+         ($p.input[$rm] // null)        as $rin  | ($p.output[$rm] // null)        as $rout |
+         ($p.input[$requested] // null) as $sin  | ($p.output[$requested] // null) as $sout |
+         if ($rin == null or $rout == null or $sin == null or $sout == null) then 0
+         else
+           (($t.in + 1.25 * $t.cwrt + 0.1 * $t.crd) / 1000) as $input_units |
+           ($t.out / 1000)                                  as $output_units |
+           ($input_units * $rin + $output_units * $rout)    as $routed_cost |
+           ($input_units * $sin + $output_units * $sout)    as $requested_cost |
+           ($requested_cost - $routed_cost)
+         end
+       end) as $savings |
+      "\($savings) \($t.in) \($t.out) \($t.crd) \($t.cwrt)"
+    ' "$transcript_path" 2>/dev/null \
+    | awk 'BEGIN{s=0; i=0; o=0; r=0; w=0}
+           {s+=$1; i+=$2; o+=$3; r+=$4; w+=$5}
+           END{printf "%.4f %d %d %d %d\n", s, i, o, r, w}'
+  ) || true
+fi
+
+# ---------- refresh when a model isn't in the pricing table ----------
+#
+# A model that shipped after this copy of the script has no price entry, so the
+# jq guard above zeroes savings on every turn and the line reads "saved $0.00"
+# — indistinguishable from "the router ran and didn't beat your selection". The
+# periodic check heals that eventually, but a week late, and a model launch is
+# exactly when the number gets looked at. Refresh off-schedule instead.
+#
+# Keyed on its own stamp per unpriced id: a model we never price (self-hosted,
+# unrecognized) then costs one download per interval, not one per turn, and
+# can't starve the periodic check.
+weave_refresh_on_price_miss() {
+  local candidates="" m
+  for m in "$@"; do
+    case "$m" in
+      "" | "?" | failure | weave-router | "<synthetic>") continue ;;
+    esac
+    candidates="${candidates}${m}"$'\n'
+  done
+  [ -n "$candidates" ] || return 0
+
+  # A malformed $prices emits nothing here, which fails closed (no refresh)
+  # rather than re-downloading every turn.
+  local missing
+  missing="$(printf '%s' "$candidates" \
+    | jq -rR --argjson p "$prices" \
+        'select($p.input[.] == null or $p.output[.] == null)' 2>/dev/null \
+    | head -n 1)" || return 0
+  [ -n "$missing" ] || return 0
+
+  local model_slug
+  model_slug="$(printf '%s' "$missing" | tr -c 'A-Za-z0-9._-' '_')"
+  weave_self_refresh ".miss.${model_slug}" 1
+}
+weave_refresh_on_price_miss "$requested_norm" "$routed" 2>/dev/null || true
+
+# Brand color (#FF6C47) on terminals that grok 24-bit truecolor — that's
+# every modern one (iTerm2, Apple Terminal, vscode, ghostty, alacritty,
+# wezterm, kitty). Falls back gracefully on any escape-stripping terminal.
+brand=$'\033[38;2;255;108;71mWEAVE ROUTER\033[0m'
+
+# Format helpers.
+fmt_money() {
+  awk -v v="$1" 'BEGIN{
+    if (v == "" || v+0 == 0)        { printf "$0.00";        exit }
+    if (v+0 < 0.005 && v+0 > -0.005){ printf "<$0.01";       exit }
+    if (v+0 < 0)                    { printf "-$%.2f", -v+0; exit }
+    printf "$%.2f", v
+  }'
+}
+
+fmt_tok() {
+  awk -v v="$1" 'BEGIN{
+    v = v+0
+    if (v >= 1000000) { printf "%.1fM", v/1000000; exit }
+    if (v >= 1000)    { printf "%.1fk", v/1000;    exit }
+    printf "%d", v
+  }'
+}
+
+# cache_read tokens are the cached portion of every prompt that the
+# provider serves at 0.1× input price; cache_write tokens are the bytes
+# that get newly cached on this turn at 1.25× input price. They behave
+# completely differently both in cost and in what they tell the user
+# about session-level efficiency, so we surface them separately rather
+# than summing into a single "cached" number that conflates the two.
+# Each clause is shown only when nonzero, so quiet sessions stay quiet.
+tokens_clause=""
+if [[ "$tot_in" -gt 0 || "$tot_out" -gt 0 || "$tot_cache_read" -gt 0 || "$tot_cache_write" -gt 0 ]]; then
+  tokens_clause=" · $(fmt_tok "$tot_in") in / $(fmt_tok "$tot_out") out"
+  if [[ "$tot_cache_read" -gt 0 ]]; then
+    tokens_clause+=" / $(fmt_tok "$tot_cache_read") cache read"
+  fi
+  if [[ "$tot_cache_write" -gt 0 ]]; then
+    tokens_clause+=" / $(fmt_tok "$tot_cache_write") cache write"
+  fi
+fi
+
+if [[ "$forced" == "true" ]]; then
+  # Session is pinned via /force-model. The "← selection · saved $X" clause
+  # describes automatic routing and would be misleading on a manual pin, so
+  # show the pinned model with a [forced] tag instead. forced_model comes from
+  # the marker; fall back to the routed/selected id if parsing came up empty.
+  forced_display="${forced_model:-${routed:-$selected_display}}"
+  printf '%s — %s [forced]%s' "$brand" "$forced_display" "$tokens_clause"
+elif [[ "$routed" == "failure" ]]; then
+  # Latest turn was a CC-synthesized error stub — don't claim a routing
+  # swap or compute savings against a non-model.
+  printf '%s — %s%s' "$brand" "$routed" "$tokens_clause"
+elif [[ -n "$routed" ]]; then
+  # Always show the savings clause, flooring a non-positive total at $0.00.
+  # session_savings is "0.0000" on fresh sessions or sessions where every
+  # turn routed back to the selected model, and can go negative when routing
+  # upgrades a turn to a pricier model (e.g. a sticky/hard-pinned side-call,
+  # or a hard turn escalated to opus). "saved -$X" would mislead, so clamp
+  # the display to $0.00 rather than dropping the clause — a $0.00 readout
+  # tells the user the router ran and simply didn't beat their selection.
+  # When the CC selection is unknown ("?" or empty) there's nothing to
+  # compare against, so drop the "← selection" arrow and just show routed.
+  display_savings="$session_savings"
+  if [[ -z "$display_savings" ]] \
+     || awk -v v="$display_savings" 'BEGIN{exit !(v+0 < 0)}'; then
+    display_savings="0"
+  fi
+  if [[ -n "$selected_display" && "$selected_display" != "?" ]]; then
+    printf '%s — %s ← %s · saved %s%s' \
+      "$brand" "$routed" "$selected_display" "$(fmt_money "$display_savings")" "$tokens_clause"
+  else
+    printf '%s — %s%s' "$brand" "$routed" "$tokens_clause"
+  fi
+else
+  printf '%s — %s%s' "$brand" "$selected_display" "$tokens_clause"
+fi

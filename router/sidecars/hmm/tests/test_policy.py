@@ -1,0 +1,141 @@
+from __future__ import annotations
+
+import os
+from pathlib import Path
+
+import pytest
+
+from hmm_sidecar.artifacts import resolve_artifacts, sha256_file
+from hmm_sidecar.policy import (
+    FrozenPolicy,
+    select_roster_arm,
+    select_roster_group,
+    selected_margin,
+)
+
+
+class FixedEmbedder:
+    def __init__(self, vector: list[float]) -> None:
+        self.vector = vector
+
+    async def embed(self, texts: list[str]) -> list[list[float]]:
+        return [self.vector for _ in texts]
+
+
+def test_roster_ids_dedupes_arms_across_clusters_in_first_seen_order() -> None:
+    policy = object.__new__(FrozenPolicy)
+    policy.clusters = {
+        "fast": {"arms": ["deepseek/deepseek-v4-flash", "openai/gpt-5.4-nano"]},
+        "balanced": {"arms": ["openai/gpt-5.6-luna", "deepseek/deepseek-v4-flash"]},
+        "empty": {},
+    }
+
+    assert policy.roster_ids() == [
+        "deepseek/deepseek-v4-flash",
+        "openai/gpt-5.4-nano",
+        "openai/gpt-5.6-luna",
+    ]
+
+
+def test_roster_fallback_reports_the_selected_classifier_group() -> None:
+    probabilities = {"fast": 0.2, "maximum": 0.8}
+
+    label, roster_id = select_roster_arm(
+        probabilities=probabilities,
+        classes=("fast", "maximum"),
+        clusters={
+            "fast": {"arms": ["provider/fast"]},
+            "maximum": {"arms": ["provider/maximum"]},
+        },
+        available_roster_ids={"provider/fast"},
+    )
+
+    assert label == "fast"
+    assert roster_id == "provider/fast"
+    assert selected_margin(probabilities, label) == pytest.approx(-0.6)
+
+
+def test_group_selection_uses_class_order_ties_and_returns_every_arm() -> None:
+    group, arms, fallback = select_roster_group(
+        probabilities={"fast": 0.5, "maximum": 0.5},
+        classes=("fast", "maximum"),
+        clusters={
+            "fast": {"arms": ["provider/a", "provider/b"]},
+            "maximum": {"arms": ["provider/c"]},
+        },
+        available_roster_ids={"provider/a", "provider/b", "provider/c"},
+    )
+
+    assert group == "fast"
+    assert arms == ("provider/a", "provider/b")
+    assert tuple(item.group for item in fallback) == ("fast", "maximum")
+
+
+def test_group_selection_falls_back_and_retains_zero_arm_result() -> None:
+    group, arms, fallback = select_roster_group(
+        probabilities={"fast": 0.8, "maximum": 0.2},
+        classes=("fast", "maximum"),
+        clusters={
+            "fast": {"arms": ["provider/a"]},
+            "maximum": {"arms": ["provider/b", "provider/c"]},
+        },
+        available_roster_ids={"provider/b", "provider/c"},
+    )
+
+    assert group == "maximum"
+    assert arms == ("provider/b", "provider/c")
+    assert fallback[0].eligible_arms == ()
+
+    empty_group, empty_arms, _ = select_roster_group(
+        probabilities={"fast": 0.8, "maximum": 0.2},
+        classes=("fast", "maximum"),
+        clusters={"fast": {"arms": ["provider/a"]}, "maximum": {"arms": []}},
+        available_roster_ids=set(),
+    )
+    assert empty_group is None
+    assert empty_arms == ()
+
+
+@pytest.mark.skipif(
+    not os.environ.get("HMM_TEST_PACKAGE"),
+    reason="published package is supplied by the release-artifact CI step",
+)
+async def test_published_package_routes_an_offered_candidate(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    package = Path(os.environ["HMM_TEST_PACKAGE"])
+    monkeypatch.setenv("HMM_PACKAGE_PATH", str(package))
+    monkeypatch.delenv("HMM_PACKAGE_URL", raising=False)
+    monkeypatch.setenv("HMM_PACKAGE_SHA256", sha256_file(package))
+    artifacts = resolve_artifacts()
+    policy = FrozenPolicy(artifacts, FixedEmbedder(artifacts.probe_vector.tolist()))
+    selected_label = "maximum"
+    roster_id = policy.clusters[selected_label]["arms"][0]
+
+    result = await policy.route(
+        {
+            "schema_version": "policy_router_v1",
+            "route_id": "release-smoke-route",
+            "prompt_text": "Implement the requested change.",
+            "conversation_messages": [
+                {"role": "user", "text": "Implement the requested change."}
+            ],
+            "candidates": [
+                {
+                    "roster_id": roster_id,
+                    "catalog_id": roster_id,
+                    "provider": roster_id.split("/", 1)[0],
+                    "capabilities": {},
+                }
+            ],
+        }
+    )
+
+    assert result.route_id == "release-smoke-route"
+    assert result.selected_roster_id == roster_id
+    assert result.policy_label == selected_label
+    assert result.policy_artifact_sha256 == sha256_file(package)
+    # ranked_fallback must be populated so the Go side can apply per-key
+    # cluster allowlist overrides.
+    assert result.ranked_fallback
+    assert any(group.group == selected_label for group in result.ranked_fallback)

@@ -1,0 +1,180 @@
+# yaml-language-server: $schema=https://json.schemastore.org/github-workflow.json
+name: Test
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:15-alpine
+        env:
+          POSTGRES_USER: router
+          POSTGRES_PASSWORD: router
+          POSTGRES_DB: router
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U router -d router"
+          --health-interval 1s
+          --health-timeout 3s
+          --health-retries 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache-dependency-path: go.sum
+
+      - name: Install golang-migrate
+        run: |
+          curl -L https://github.com/golang-migrate/migrate/releases/download/v4.17.1/migrate.linux-amd64.tar.gz \
+            | tar xvz
+          sudo mv migrate /usr/local/bin/migrate
+
+      - name: Install sqlc
+        run: |
+          curl -L https://downloads.sqlc.dev/sqlc_1.30.0_linux_amd64.tar.gz | tar xvz
+          sudo mv sqlc /usr/local/bin/sqlc
+
+      # The docker-compose stack pre-creates the router schema via an init
+      # script mounted into postgres. CI's service container has no such
+      # init hook, so we recreate that step explicitly here.
+      - name: Pre-create router schema
+        env:
+          PGPASSWORD: router
+        run: |
+          psql -h localhost -p 5432 -U router -d router \
+            -c "CREATE SCHEMA IF NOT EXISTS router;"
+
+      - name: Apply migrations
+        run: |
+          migrate -path ./db/migrations \
+            -database 'postgres://router:router@localhost:5432/router?sslmode=disable&search_path=router' \
+            up
+
+      # Round-trip catches reversible-migration regressions: a broken
+      # down.sql would silently rot until someone tries to roll back.
+      - name: Roll migrations down then back up
+        run: |
+          migrate -path ./db/migrations \
+            -database 'postgres://router:router@localhost:5432/router?sslmode=disable&search_path=router' \
+            down -all
+          migrate -path ./db/migrations \
+            -database 'postgres://router:router@localhost:5432/router?sslmode=disable&search_path=router' \
+            up
+
+      # Detects schema/query drift: if migrations or queries change
+      # without regenerating internal/sqlc/, this fails the build.
+      - name: Check sqlc generation is up to date
+        working-directory: db
+        run: |
+          sqlc generate
+          if ! git diff --quiet ../internal/sqlc/; then
+            echo "::error::sqlc generation is out of date. Run 'make generate' and commit."
+            git diff ../internal/sqlc/
+            exit 1
+          fi
+
+      - name: Check formatting
+        run: |
+          UNFORMATTED=$(gofmt -l .)
+          if [ -n "$UNFORMATTED" ]; then
+            echo "::error::Go files are not formatted. Run 'gofmt -w .' on:"
+            echo "$UNFORMATTED"
+            exit 1
+          fi
+
+      - name: Vet
+        run: go vet ./...
+
+      - name: Typecheck
+        run: go build -o /dev/null ./...
+
+      - name: Run tests
+        run: go test -count=1 ./...
+
+  # Separate job: needs no Go toolchain, Postgres, or network. The statusline is
+  # shipped to users as a standalone script, so a regression there is invisible
+  # to `go test`.
+  test-statusline:
+    name: Test cc-statusline
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Run statusline tests
+        run: make test-statusline
+
+  test-hmm-sidecar:
+    name: Test frozen HMM sidecar
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12.3"
+
+      - name: Install Poetry
+        run: pip install poetry==1.8.4
+
+      - name: Install dependencies
+        working-directory: sidecars/hmm
+        run: poetry install --no-interaction
+
+      - name: Check formatting
+        working-directory: sidecars/hmm
+        run: poetry run black --check hmm_sidecar scripts tests
+
+      - name: Run tests
+        working-directory: sidecars/hmm
+        run: poetry run pytest -q
+
+      - name: Verify published artifact
+        working-directory: sidecars/hmm
+        run: |
+          curl --fail --location --output /tmp/hmm-router-frozen-v1.tar.gz \
+            https://github.com/workweave/router/releases/download/hmm-model-v1/hmm-router-frozen-v1.tar.gz
+          echo "b326bda644aac86831bae47d0b69de008046f62324a4b93a1eba702581c174df  /tmp/hmm-router-frozen-v1.tar.gz" \
+            | sha256sum --check
+          poetry run python -m scripts.verify_artifact \
+            /tmp/hmm-router-frozen-v1.tar.gz \
+            --sha256 b326bda644aac86831bae47d0b69de008046f62324a4b93a1eba702581c174df
+          HMM_TEST_PACKAGE=/tmp/hmm-router-frozen-v1.tar.gz \
+            poetry run pytest -q tests/test_policy.py
+
+      - name: Build sidecar image
+        run: docker build --file sidecars/hmm/Dockerfile --tag router-hmm-sidecar:test .
+
+      - name: Smoke-test liveness without credentials
+        run: |
+          trap 'docker rm --force router-hmm-sidecar-test >/dev/null 2>&1 || true' EXIT
+          docker run --detach --name router-hmm-sidecar-test \
+            --publish 8093:8093 router-hmm-sidecar:test
+          for attempt in $(seq 1 30); do
+            curl --fail http://127.0.0.1:8093/livez && exit 0
+            sleep 1
+          done
+          docker logs router-hmm-sidecar-test
+          exit 1
+
+      - name: Validate HMM Compose overlay
+        run: |
+          docker compose -f docker-compose.yml -f sidecars/hmm/docker-compose.yml \
+            --profile hmm config --quiet

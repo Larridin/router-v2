@@ -1,0 +1,276 @@
+// Package postgres implements auth repositories over the SQLC-generated *sqlc.Queries.
+package postgres
+
+import (
+	"context"
+
+	"workweave/router/internal/auth"
+	"workweave/router/internal/sqlc"
+
+	"github.com/google/uuid"
+)
+
+// Repository aggregates all repositories backed by the same DBTX.
+type Repository struct {
+	Installations     auth.InstallationRepository
+	APIKeys           auth.APIKeyRepository
+	ExternalAPIKeys   auth.ExternalAPIKeyRepository
+	Users             auth.UserRepository
+	ClusterModelLists auth.ClusterModelListRepository
+	Telemetry         *TelemetryRepo
+	Feedback          *FeedbackRepo
+}
+
+// NewRepository constructs a Repository. Pass auth.NoOpEncryptor{} for local dev without a keyset.
+func NewRepository(tx sqlc.DBTX, encryptor auth.Encryptor) *Repository {
+	return &Repository{
+		Installations:     &installationRepo{tx: tx},
+		APIKeys:           &apiKeyRepo{tx: tx},
+		ExternalAPIKeys:   NewExternalAPIKeyRepo(tx, encryptor),
+		Users:             NewUserRepository(tx),
+		ClusterModelLists: NewClusterModelListRepo(tx),
+		Telemetry:         NewTelemetryRepo(tx),
+		Feedback:          NewFeedbackRepo(tx),
+	}
+}
+
+type installationRepo struct {
+	tx sqlc.DBTX
+}
+
+func (r *installationRepo) Create(ctx context.Context, params auth.CreateInstallationParams) (*auth.Installation, error) {
+	q := sqlc.New(r.tx)
+	row, err := q.CreateModelRouterInstallation(ctx, sqlc.CreateModelRouterInstallationParams{
+		ExternalID: params.ExternalID,
+		Name:       params.Name,
+		CreatedBy:  params.CreatedBy,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return toAuthInstallation(row), nil
+}
+
+func (r *installationRepo) Get(ctx context.Context, externalID, id string) (*auth.Installation, error) {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return nil, err
+	}
+	q := sqlc.New(r.tx)
+	row, err := q.GetModelRouterInstallation(ctx, sqlc.GetModelRouterInstallationParams{
+		ID:         parsed,
+		ExternalID: externalID,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return toAuthInstallation(row), nil
+}
+
+func (r *installationRepo) ListForExternalID(ctx context.Context, externalID string) ([]*auth.Installation, error) {
+	q := sqlc.New(r.tx)
+	rows, err := q.ListModelRouterInstallationsForExternalID(ctx, externalID)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*auth.Installation, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toAuthInstallation(row))
+	}
+	return out, nil
+}
+
+func (r *installationRepo) SoftDelete(ctx context.Context, externalID, id string) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	q := sqlc.New(r.tx)
+	return q.SoftDeleteModelRouterInstallation(ctx, sqlc.SoftDeleteModelRouterInstallationParams{
+		ID:         parsed,
+		ExternalID: externalID,
+	})
+}
+
+func (r *installationRepo) UpdateExcludedModels(ctx context.Context, externalID, id string, models []string) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	if models == nil {
+		models = []string{}
+	}
+	q := sqlc.New(r.tx)
+	rows, err := q.UpdateModelRouterInstallationExcludedModels(ctx, sqlc.UpdateModelRouterInstallationExcludedModelsParams{
+		ID:             parsed,
+		ExternalID:     externalID,
+		ExcludedModels: models,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return auth.ErrInstallationNotFound
+	}
+	return nil
+}
+
+func (r *installationRepo) UpdateExcludedProviders(ctx context.Context, externalID, id string, providerNames []string) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	if providerNames == nil {
+		providerNames = []string{}
+	}
+	q := sqlc.New(r.tx)
+	rows, err := q.UpdateModelRouterInstallationExcludedProviders(ctx, sqlc.UpdateModelRouterInstallationExcludedProvidersParams{
+		ID:                parsed,
+		ExternalID:        externalID,
+		ExcludedProviders: providerNames,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return auth.ErrInstallationNotFound
+	}
+	return nil
+}
+
+func (r *installationRepo) UpdateRoutingPreference(ctx context.Context, externalID, id string, qualityWeight *float64) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	q := sqlc.New(r.tx)
+	rows, err := q.UpdateModelRouterInstallationRoutingPreference(ctx, sqlc.UpdateModelRouterInstallationRoutingPreferenceParams{
+		ID:                   parsed,
+		ExternalID:           externalID,
+		RoutingQualityWeight: qualityWeight,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return auth.ErrInstallationNotFound
+	}
+	return nil
+}
+
+func (r *installationRepo) UpdateUsageBypass(ctx context.Context, externalID, id string, enabled bool, threshold *float64) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	q := sqlc.New(r.tx)
+	rows, err := q.UpdateModelRouterInstallationUsageBypass(ctx, sqlc.UpdateModelRouterInstallationUsageBypassParams{
+		ID:                   parsed,
+		ExternalID:           externalID,
+		UsageBypassEnabled:   enabled,
+		UsageBypassThreshold: threshold,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return auth.ErrInstallationNotFound
+	}
+	return nil
+}
+
+func (r *installationRepo) UpdateSubscriptionRoutingDisabled(ctx context.Context, externalID, id string, disabled bool) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	q := sqlc.New(r.tx)
+	rows, err := q.UpdateModelRouterInstallationSubscriptionRoutingDisabled(ctx, sqlc.UpdateModelRouterInstallationSubscriptionRoutingDisabledParams{
+		ID:                          parsed,
+		ExternalID:                  externalID,
+		SubscriptionRoutingDisabled: disabled,
+	})
+	if err != nil {
+		return err
+	}
+	if rows == 0 {
+		return auth.ErrInstallationNotFound
+	}
+	return nil
+}
+
+type apiKeyRepo struct {
+	tx sqlc.DBTX
+}
+
+func (r *apiKeyRepo) Create(ctx context.Context, params auth.CreateAPIKeyParams) (*auth.APIKey, error) {
+	installationID, err := uuid.Parse(params.InstallationID)
+	if err != nil {
+		return nil, err
+	}
+	q := sqlc.New(r.tx)
+	row, err := q.CreateModelRouterAPIKey(ctx, sqlc.CreateModelRouterAPIKeyParams{
+		InstallationID: installationID,
+		ExternalID:     params.ExternalID,
+		Name:           params.Name,
+		KeyPrefix:      params.KeyPrefix,
+		KeyHash:        params.KeyHash,
+		KeySuffix:      params.KeySuffix,
+		CreatedBy:      params.CreatedBy,
+	})
+	if err != nil {
+		return nil, err
+	}
+	return toAuthAPIKey(row), nil
+}
+
+func (r *apiKeyRepo) GetActiveByHashWithInstallation(ctx context.Context, keyHash string) (*auth.APIKey, *auth.Installation, error) {
+	q := sqlc.New(r.tx)
+	row, err := q.GetActiveModelRouterAPIKeyWithInstallationByHash(ctx, keyHash)
+	if err != nil {
+		return nil, nil, err
+	}
+	return toAuthAPIKey(row.RouterModelRouterAPIKey), toAuthInstallation(row.RouterModelRouterInstallation), nil
+}
+
+func (r *apiKeyRepo) ListForInstallation(ctx context.Context, installationID string) ([]*auth.APIKey, error) {
+	parsed, err := uuid.Parse(installationID)
+	if err != nil {
+		return nil, err
+	}
+	q := sqlc.New(r.tx)
+	rows, err := q.ListModelRouterAPIKeysForInstallation(ctx, parsed)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]*auth.APIKey, 0, len(rows))
+	for _, row := range rows {
+		out = append(out, toAuthAPIKey(row))
+	}
+	return out, nil
+}
+
+func (r *apiKeyRepo) MarkUsed(ctx context.Context, id string) error {
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return err
+	}
+	q := sqlc.New(r.tx)
+	return q.MarkModelRouterAPIKeyUsed(ctx, parsed)
+}
+
+func (r *apiKeyRepo) SoftDelete(ctx context.Context, installationID, id string) (int64, error) {
+	installationUUID, err := uuid.Parse(installationID)
+	if err != nil {
+		return 0, err
+	}
+	parsed, err := uuid.Parse(id)
+	if err != nil {
+		return 0, err
+	}
+	q := sqlc.New(r.tx)
+	return q.SoftDeleteModelRouterAPIKey(ctx, sqlc.SoftDeleteModelRouterAPIKeyParams{
+		ID:             parsed,
+		InstallationID: installationUUID,
+	})
+}

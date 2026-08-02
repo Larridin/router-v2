@@ -1,0 +1,619 @@
+package translate_test
+
+import (
+	"bufio"
+	"bytes"
+	"encoding/json"
+	"errors"
+	"net/http/httptest"
+	"strings"
+	"testing"
+
+	"workweave/router/internal/translate"
+
+	"github.com/stretchr/testify/assert"
+	"github.com/stretchr/testify/require"
+	"github.com/tidwall/gjson"
+)
+
+func TestResponsesToChatCompletions_InstructionsAndInput(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5",
+		"instructions": "be helpful",
+		"stream": true,
+		"input": [
+			{"type": "message", "role": "user", "content": [{"type": "input_text", "text": "hi"}]}
+		]
+	}`)
+
+	out, isStream, model, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+	assert.True(t, isStream)
+	assert.Equal(t, "gpt-5", model)
+
+	root := gjson.ParseBytes(out)
+	assert.Equal(t, "gpt-5", root.Get("model").Str)
+	assert.True(t, root.Get("stream").Bool())
+	assert.True(t, root.Get("stream_options.include_usage").Bool())
+
+	messages := root.Get("messages").Array()
+	require.Len(t, messages, 2)
+	assert.Equal(t, "system", messages[0].Get("role").Str)
+	assert.Equal(t, "be helpful", messages[0].Get("content").Str)
+	assert.Equal(t, "user", messages[1].Get("role").Str)
+	assert.Equal(t, "hi", messages[1].Get("content").Str)
+}
+
+func TestResponsesToChatCompletions_FunctionCallRoundTrip(t *testing.T) {
+	// Codex re-sends prior tool calls + their outputs in the input array.
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type": "message", "role": "user", "content": "do the thing"},
+			{"type": "function_call", "call_id": "call_123", "name": "do_thing", "arguments": "{\"x\":1}"},
+			{"type": "function_call_output", "call_id": "call_123", "output": "done"}
+		]
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	require.Len(t, messages, 3)
+
+	// Assistant function_call → assistant message with tool_calls.
+	assert.Equal(t, "assistant", messages[1].Get("role").Str)
+	tc := messages[1].Get("tool_calls.0")
+	assert.Equal(t, "call_123", tc.Get("id").Str)
+	assert.Equal(t, "do_thing", tc.Get("function.name").Str)
+	assert.Equal(t, `{"x":1}`, tc.Get("function.arguments").Str)
+
+	// function_call_output → tool role message keyed by tool_call_id.
+	assert.Equal(t, "tool", messages[2].Get("role").Str)
+	assert.Equal(t, "call_123", messages[2].Get("tool_call_id").Str)
+	assert.Equal(t, "done", messages[2].Get("content").Str)
+}
+
+func TestResponsesToChatCompletions_ToolsFlatToNested(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": "hi",
+		"tools": [
+			{"type": "function", "name": "search", "description": "search docs", "parameters": {"type": "object"}}
+		]
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+
+	tools := gjson.GetBytes(out, "tools").Array()
+	require.Len(t, tools, 1)
+	assert.Equal(t, "function", tools[0].Get("type").Str)
+	assert.Equal(t, "search", tools[0].Get("function.name").Str)
+	assert.Equal(t, "search docs", tools[0].Get("function.description").Str)
+	assert.True(t, tools[0].Get("function.parameters").IsObject())
+}
+
+func TestConvertResponsesToChatCompletions_CustomToolStaysNative(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5",
+		"input":"use the tool",
+		"tools":[{"type":"custom","name":"apply_patch","description":"opaque payload"}]
+	}`)
+
+	converted, err := translate.ConvertResponsesToChatCompletions(body)
+	require.NoError(t, err)
+	assert.True(t, converted.Requirements.NativeOnly)
+	assert.True(t, converted.Requirements.CustomTools)
+	assert.Equal(t, body, converted.OriginalBody, "native dispatch must retain unknown tool bytes verbatim")
+	assert.Len(t, converted.Report, 1)
+	assert.Equal(t, "responses_non_function_tool_native_only", converted.Report[0].Code)
+	assert.Empty(t, gjson.GetBytes(converted.Body, "tools").Array(), "routing projection must not pretend a custom tool is a function")
+}
+
+func TestConvertResponsesToChatCompletions_UnknownInputStaysNative(t *testing.T) {
+	body := []byte(`{
+		"model":"gpt-5",
+		"input":[{"type":"computer_call","id":"comp_1","action":{"type":"click"}}]
+	}`)
+
+	converted, err := translate.ConvertResponsesToChatCompletions(body)
+	require.NoError(t, err)
+	assert.True(t, converted.Requirements.NativeOnly)
+	require.Len(t, converted.Report, 1)
+	assert.Equal(t, "responses_unknown_input_native_only", converted.Report[0].Code)
+}
+
+func TestResponsesToChatCompletions_ToolChoiceRequiresTools(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": "hi",
+		"tool_choice": "auto"
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+	assert.False(t, gjson.GetBytes(out, "tool_choice").Exists())
+}
+
+func TestResponsesToChatCompletions_StripsRoutingBadgeFromAssistantHistory(t *testing.T) {
+	// The egress badge must not survive ingress, or repeated turns leak
+	// router bytes that break prompt-cache reuse.
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type": "message", "role": "user", "content": "hi"},
+			{"type": "message", "role": "assistant", "content": [
+				{"type": "output_text", "text": "**WEAVE ROUTER** — claude-opus-4-7 ← gpt-5.5\n\nHello there!"}
+			]},
+			{"type": "message", "role": "user", "content": "again"}
+		]
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	require.Len(t, messages, 3)
+	assert.Equal(t, "assistant", messages[1].Get("role").Str)
+	assert.Equal(t, "Hello there!", messages[1].Get("content").Str)
+}
+
+func TestResponsesToChatCompletions_StripsVerboseRoutingMarker(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type": "message", "role": "assistant", "content": "✦ **WEAVE ROUTER** → minimax/minimax-m3 · best pick for this turn\n↳ classifier balanced\n↳ bandit arm minimax\n\nbody"}
+		]
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	require.Len(t, messages, 1)
+	assert.Equal(t, "body", messages[0].Get("content").Str)
+}
+
+func TestResponsesToChatCompletions_StripsBadgeFromStringContent(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type": "message", "role": "assistant", "content": "**WEAVE ROUTER** — claude-opus-4-7\n\nbody"}
+		]
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	require.Len(t, messages, 1)
+	assert.Equal(t, "body", messages[0].Get("content").Str)
+}
+
+func TestResponsesToChatCompletions_LeavesUserContentAlone(t *testing.T) {
+	// User content that happens to start with the marker bytes (e.g. someone
+	// pasting our log line in) must not be silently mutated.
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": [
+			{"type": "message", "role": "user", "content": "**WEAVE ROUTER** — something\n\nplease explain"}
+		]
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+
+	messages := gjson.GetBytes(out, "messages").Array()
+	require.Len(t, messages, 1)
+	assert.Contains(t, messages[0].Get("content").Str, "**WEAVE ROUTER**")
+}
+
+func TestResponsesToChatCompletions_MaxOutputAndDropsReasoning(t *testing.T) {
+	body := []byte(`{
+		"model": "gpt-5",
+		"input": "hi",
+		"max_output_tokens": 4096,
+		"reasoning": {"effort": "high"}
+	}`)
+
+	out, _, _, err := translate.ResponsesToChatCompletions(body)
+	require.NoError(t, err)
+
+	assert.Equal(t, int64(4096), gjson.GetBytes(out, "max_completion_tokens").Int())
+	// reasoning is intentionally dropped pre-routing: forwarding it as
+	// reasoning_effort broke every non-Gemini served model.
+	assert.False(t, gjson.GetBytes(out, "reasoning_effort").Exists(),
+		"reasoning_effort must not be propagated into the chat body")
+	assert.False(t, gjson.GetBytes(out, "reasoning").Exists())
+}
+
+// Codex always sends a `reasoning` field, including effort:"none" (invalid as
+// reasoning_effort); reasoning OpenAI models also 400 on reasoning_effort+tools.
+// No effort value may leak into the translated chat body.
+func TestResponsesToChatCompletions_DropsReasoningEffort(t *testing.T) {
+	for _, effort := range []string{"none", "minimal", "low", "medium", "high"} {
+		body := []byte(`{"model":"gpt-5.5","input":"hi","reasoning":{"effort":"` + effort + `"},"include":["reasoning.encrypted_content"]}`)
+		out, _, _, err := translate.ResponsesToChatCompletions(body)
+		require.NoError(t, err)
+		assert.Falsef(t, gjson.GetBytes(out, "reasoning_effort").Exists(),
+			"effort %q must not propagate", effort)
+	}
+}
+
+// Once response.created is on the wire, an upstream error must terminate with
+// response.failed, never a bare disconnect (Codex reports that as "stream
+// closed before response.completed").
+func TestResponsesWriter_FinalizeErrorEmitsFailed(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "")
+
+	require.NoError(t, w.Prelude(true)) // emits response.created
+	require.NoError(t, w.FinalizeError(errors.New("upstream 400")))
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	types := eventTypes(events)
+	assert.Contains(t, types, "response.created")
+	assert.Contains(t, types, "response.failed")
+	assert.NotContains(t, types, "response.completed")
+
+	final := events[len(events)-1]
+	require.Equal(t, "response.failed", final["type"])
+	resp := final["response"].(map[string]any)
+	assert.Equal(t, "failed", resp["status"])
+	assert.NotNil(t, resp["error"])
+}
+
+// Before anything streams, FinalizeError writes nothing so the handler can
+// still emit a JSON error envelope.
+func TestResponsesWriter_FinalizeErrorNoopBeforeCreated(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "")
+
+	require.NoError(t, w.FinalizeError(errors.New("upstream 400")))
+	assert.Empty(t, rec.Body.Bytes())
+}
+
+func TestResponsesWriter_StreamingText(t *testing.T) {
+	rec := httptest.NewRecorder()
+	// No model / x-router-model header, so the badge stays silent and the
+	// test can focus on chunk translation.
+	w := translate.NewResponsesWriter(rec, "")
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+
+	// Simulate chat-completions chunks from the existing path.
+	chunks := []string{
+		`data: {"id":"c1","object":"chat.completion.chunk","model":"gpt-5","choices":[{"index":0,"delta":{"role":"assistant","content":""},"finish_reason":null}]}` + "\n\n",
+		`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}` + "\n\n",
+		`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}` + "\n\n",
+		`data: {"id":"c1","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":3,"completion_tokens":2,"total_tokens":5}}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, c := range chunks {
+		_, err := w.Write([]byte(c))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	types := eventTypes(events)
+	assert.Contains(t, types, "response.created")
+	assert.Contains(t, types, "response.output_item.added")
+	assert.Contains(t, types, "response.content_part.added")
+	assert.Contains(t, types, "response.output_text.delta")
+	assert.Contains(t, types, "response.output_text.done")
+	assert.Contains(t, types, "response.content_part.done")
+	assert.Contains(t, types, "response.output_item.done")
+	assert.Contains(t, types, "response.completed")
+
+	// Skip the badge prefix the writer prepends on the first delta (model
+	// "gpt-5" resolves here so the badge fires).
+	var combined strings.Builder
+	for _, e := range events {
+		if e["type"] != "response.output_text.delta" {
+			continue
+		}
+		d := e["delta"].(string)
+		if strings.HasPrefix(d, "**Weave Router**") {
+			continue
+		}
+		combined.WriteString(d)
+	}
+	assert.Equal(t, "Hello world", combined.String())
+
+	// Final completed event carries usage.
+	final := events[len(events)-1]
+	assert.Equal(t, "response.completed", final["type"])
+	usage := final["response"].(map[string]any)["usage"].(map[string]any)
+	assert.EqualValues(t, 3, usage["input_tokens"])
+	assert.EqualValues(t, 2, usage["output_tokens"])
+}
+
+// When upstream already speaks Responses natively, the writer must forward
+// bytes unchanged and skip its own response.created prelude.
+func TestResponsesWriter_PassthroughForwardsVerbatim(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.5")
+	w.SetPassthrough()
+
+	// Prelude is a no-op in passthrough — the upstream emits response.created.
+	require.NoError(t, w.Prelude(true))
+
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+
+	// Verbatim Responses SSE, as the Codex backend emits it.
+	native := "event: response.created\ndata: {\"type\":\"response.created\"}\n\n" +
+		"event: response.output_text.delta\ndata: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n" +
+		"event: response.completed\ndata: {\"type\":\"response.completed\"}\n\n"
+	_, err := w.Write([]byte(native))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+
+	// Output is exactly the upstream bytes: no chat->Responses translation, no
+	// synthesized or duplicated events.
+	assert.Equal(t, native, rec.Body.String())
+}
+
+func TestResponsesWriter_PrependsBadgeOnSwap(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5.5")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("x-router-model", "claude-opus-4-7")
+	w.WriteHeader(200)
+
+	for _, c := range []string{
+		`data: {"choices":[{"index":0,"delta":{"content":"Hello"},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"content":" world"},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n",
+		"data: [DONE]\n\n",
+	} {
+		_, err := w.Write([]byte(c))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+
+	var deltas []string
+	for _, e := range events {
+		if e["type"] == "response.output_text.delta" {
+			deltas = append(deltas, e["delta"].(string))
+		}
+	}
+	require.Len(t, deltas, 3)
+	// Format: **Weave Router** — claude-opus-4-7 ← gpt-5.5\n\n
+	assert.Contains(t, deltas[0], "**Weave Router**")
+	assert.Contains(t, deltas[0], "claude-opus-4-7")
+	assert.Contains(t, deltas[0], "← gpt-5.5")
+	assert.True(t, strings.HasSuffix(deltas[0], "\n\n"))
+	assert.Equal(t, "Hello", deltas[1])
+	assert.Equal(t, " world", deltas[2])
+
+	// response.completed appears exactly once.
+	completedCount := 0
+	for _, e := range events {
+		if e["type"] == "response.completed" {
+			completedCount++
+		}
+	}
+	assert.Equal(t, 1, completedCount)
+}
+
+func TestResponsesWriter_BadgeWithoutSwapShowsModelOnly(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "claude-opus-4-7")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("x-router-model", "claude-opus-4-7")
+	w.WriteHeader(200)
+
+	_, err := w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n"))
+	require.NoError(t, err)
+	_, err = w.Write([]byte("data: [DONE]\n\n"))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	var firstDelta string
+	for _, e := range events {
+		if e["type"] == "response.output_text.delta" {
+			firstDelta = e["delta"].(string)
+			break
+		}
+	}
+	assert.Contains(t, firstDelta, "**Weave Router**")
+	assert.Contains(t, firstDelta, "claude-opus-4-7")
+	assert.NotContains(t, firstDelta, "←")
+}
+
+func TestResponsesWriter_UsesRoutedModelFromHeader(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5")
+
+	// Simulate the proxy stamping its routing decision on the writer headers
+	// before any body bytes flow through.
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("x-router-model", "claude-opus-4-7")
+	w.Header().Set("x-router-provider", "anthropic")
+	w.WriteHeader(200)
+
+	_, err := w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":null}]}` + "\n\n"))
+	require.NoError(t, err)
+	_, err = w.Write([]byte(`data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n"))
+	require.NoError(t, err)
+	_, err = w.Write([]byte("data: [DONE]\n\n"))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+
+	// response.created and response.completed both carry the routed model.
+	var created, completed map[string]any
+	for _, e := range events {
+		switch e["type"] {
+		case "response.created":
+			created = e["response"].(map[string]any)
+		case "response.completed":
+			completed = e["response"].(map[string]any)
+		}
+	}
+	require.NotNil(t, created)
+	require.NotNil(t, completed)
+	assert.Equal(t, "claude-opus-4-7", created["model"])
+	assert.Equal(t, "claude-opus-4-7", completed["model"])
+}
+
+func TestResponsesWriter_UsesCustomBadgeText(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5")
+	w.SetBadgeText("✦ **Weave Router** → minimax/minimax-m3 · best pick for this turn\n↳ classifier balanced")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.Header().Set("x-router-model", "minimax/minimax-m3")
+	w.WriteHeader(200)
+
+	_, err := w.Write([]byte(`data: {"choices":[{"index":0,"delta":{"content":"hi"},"finish_reason":"stop"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n"))
+	require.NoError(t, err)
+	_, err = w.Write([]byte("data: [DONE]\n\n"))
+	require.NoError(t, err)
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	var firstDelta string
+	for _, e := range events {
+		if e["type"] == "response.output_text.delta" {
+			firstDelta = e["delta"].(string)
+			break
+		}
+	}
+	assert.Contains(t, firstDelta, "best pick for this turn")
+	assert.Contains(t, firstDelta, "↳ classifier balanced")
+	assert.True(t, strings.HasSuffix(firstDelta, "\n\n"))
+}
+
+func TestResponsesWriter_StreamingToolCall(t *testing.T) {
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+
+	chunks := []string{
+		`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_a","function":{"name":"do","arguments":""}}]},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"x\":"}}]},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"1}"}}]},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":1,"completion_tokens":1,"total_tokens":2}}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, c := range chunks {
+		_, err := w.Write([]byte(c))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+	types := eventTypes(events)
+	assert.Contains(t, types, "response.output_item.added")
+	assert.Contains(t, types, "response.function_call_arguments.delta")
+	assert.Contains(t, types, "response.function_call_arguments.done")
+	assert.Contains(t, types, "response.completed")
+
+	// Args reassembled.
+	var args strings.Builder
+	for _, e := range events {
+		if e["type"] == "response.function_call_arguments.delta" {
+			args.WriteString(e["delta"].(string))
+		}
+	}
+	assert.Equal(t, `{"x":1}`, args.String())
+
+	// Final item carries call_id and full arguments.
+	for _, e := range events {
+		if e["type"] == "response.function_call_arguments.done" {
+			assert.Equal(t, `{"x":1}`, e["arguments"])
+		}
+	}
+}
+
+func TestResponsesWriter_NonContiguousToolCallIndices(t *testing.T) {
+	// Upstream sends two tool calls with indices 0 and 2 (gap at 1); both
+	// must appear in the response.completed output.
+	rec := httptest.NewRecorder()
+	w := translate.NewResponsesWriter(rec, "gpt-5")
+	w.Header().Set("Content-Type", "text/event-stream")
+	w.WriteHeader(200)
+
+	chunks := []string{
+		// Tool call at index=0 (search)
+		`data: {"choices":[{"index":0,"delta":{"role":"assistant","content":null,"tool_calls":[{"index":0,"id":"call_a","function":{"name":"search","arguments":""}}]},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"arguments":"{\"q\":\"x\"}"}}]},"finish_reason":null}]}` + "\n\n",
+		// Tool call at index=2 (gap at 1 — simulates non-contiguous upstream)
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"id":"call_b","function":{"name":"lookup","arguments":""}}]},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":2,"function":{"arguments":"{\"id\":1}"}}]},"finish_reason":null}]}` + "\n\n",
+		`data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}],"usage":{"prompt_tokens":10,"completion_tokens":5,"total_tokens":15}}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	for _, c := range chunks {
+		_, err := w.Write([]byte(c))
+		require.NoError(t, err)
+	}
+	require.NoError(t, w.Finalize())
+
+	events := parseSSEEvents(t, rec.Body.Bytes())
+
+	// Find the response.completed event.
+	var completed map[string]any
+	for _, e := range events {
+		if e["type"] == "response.completed" {
+			completed = e
+			break
+		}
+	}
+	require.NotNil(t, completed, "response.completed event must be present")
+
+	response := completed["response"].(map[string]any)
+	output := response["output"].([]any)
+
+	// Both tool calls must appear in output — not just the first one.
+	require.Len(t, output, 2, "both tool calls must appear in output; got %d", len(output))
+
+	// Verify each tool call by name (order: index 0 then index 2).
+	first := output[0].(map[string]any)
+	assert.Equal(t, "search", first["name"], "first tool call must be 'search'")
+	assert.Equal(t, `{"q":"x"}`, first["arguments"])
+
+	second := output[1].(map[string]any)
+	assert.Equal(t, "lookup", second["name"], "second tool call must be 'lookup'")
+	assert.Equal(t, `{"id":1}`, second["arguments"])
+}
+
+func parseSSEEvents(t *testing.T, raw []byte) []map[string]any {
+	t.Helper()
+	var events []map[string]any
+	scanner := bufio.NewScanner(bytes.NewReader(raw))
+	scanner.Buffer(make([]byte, 64*1024), 1024*1024)
+	for scanner.Scan() {
+		line := scanner.Text()
+		if !strings.HasPrefix(line, "data:") {
+			continue
+		}
+		payload := strings.TrimSpace(strings.TrimPrefix(line, "data:"))
+		if payload == "" || payload == "[DONE]" {
+			continue
+		}
+		var m map[string]any
+		require.NoError(t, json.Unmarshal([]byte(payload), &m))
+		events = append(events, m)
+	}
+	return events
+}
+
+func eventTypes(events []map[string]any) []string {
+	out := make([]string, 0, len(events))
+	for _, e := range events {
+		if s, ok := e["type"].(string); ok {
+			out = append(out, s)
+		}
+	}
+	return out
+}

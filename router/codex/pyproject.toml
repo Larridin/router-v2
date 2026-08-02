@@ -1,0 +1,49 @@
+[project]
+name = "routerlab"
+version = "0.1.0"
+description = "Standalone training and evaluation for a core model router"
+requires-python = ">=3.12,<3.13"
+dependencies = [
+    "fastembed>=0.7,<0.8",
+    "huggingface-hub>=1.0,<2",
+    "httpx>=0.28,<0.29",
+    "numpy>=2.0,<3",
+    "scikit-learn>=1.6,<2",
+    "scipy>=1.14,<2",
+    "threadpoolctl>=3.6,<4",
+]
+
+[project.scripts]
+routerlab = "routerlab.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[dependency-groups]
+dev = [
+    "pytest>=8.3,<9",
+    "pytest-cov>=6,<7",
+    "ruff>=0.12,<0.13",
+]
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/routerlab"]
+
+[tool.pytest.ini_options]
+addopts = "--strict-markers"
+pythonpath = ["src"]
+testpaths = ["tests"]
+
+[tool.uv]
+cache-keys = [
+    { file = "pyproject.toml" },
+    { file = "src/routerlab/**/*.py" },
+]
+
+[tool.ruff]
+target-version = "py312"
+line-length = 100
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "N", "UP", "B", "SIM", "RUF"]

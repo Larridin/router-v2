@@ -1,0 +1,282 @@
+# Configuration reference
+
+All router configuration is via environment variables ([12-factor](https://12factor.net/config)).
+This page is the exhaustive reference; the [README](../README.md) has the
+60-second quickstart.
+
+## Table of contents
+
+- [Provider API keys](#provider-api-keys)
+- [Postgres](#postgres)
+- [Server](#server)
+- [Routing](#routing)
+- [Policy sidecars](#policy-sidecars)
+- [BYOK encryption](#byok-encryption)
+- [Telemetry (OpenTelemetry)](#telemetry-opentelemetry)
+- [Cluster-routing artifacts](#cluster-routing-artifacts)
+
+## Provider API keys
+
+The router registers each upstream provider only when its API key is present
+in the environment. Anthropic is special: when `ANTHROPIC_API_KEY` is unset,
+the router still registers the provider but forwards Anthropic auth headers
+(`Authorization` / `x-api-key`) to `api.anthropic.com` directly. This lets
+Claude Code keep using the user's logged-in plan.
+
+| Variable              | Default                                                   | Effect |
+| --------------------- | --------------------------------------------------------- | ------ |
+| `OPENROUTER_API_KEY`  | *(none)*                                                  | **Recommended baseline.** Enables OpenRouter and the full OSS-model pool the cluster scorer is trained against. |
+| `OPENROUTER_BASE_URL` | `https://openrouter.ai/api/v1`                            | Override for OpenRouter or any OpenAI-compatible endpoint (vLLM, Together, Fireworks, self-hosted). |
+| `ANTHROPIC_API_KEY`   | *(none — passthrough)*                                    | Router's own Anthropic key. When unset, client `Authorization` headers pass through. |
+| `OPENAI_API_KEY`      | *(none)*                                                  | Enables the OpenAI provider (Chat Completions API). |
+| `OPENAI_BASE_URL`     | `https://api.openai.com`                                  | Override for OpenAI (e.g. Azure OpenAI). |
+| `GOOGLE_API_KEY`      | *(none)*                                                  | Enables Gemini via its OpenAI-compatible endpoint. |
+| `GOOGLE_BASE_URL`     | `https://generativelanguage.googleapis.com/v1beta/openai` | Override for Gemini. |
+
+**BYOK (per-installation keys).** Instead of (or in addition to) the env vars
+above, each installation can supply its own provider keys via the dashboard.
+Those are stored in Postgres and used only for that installation's traffic. A
+key may also carry its own base URL, which overrides the deployment's endpoint
+for that provider on that installation's requests — useful when a customer runs
+their own deployment of an OpenAI-compatible provider.
+See [BYOK encryption](#byok-encryption).
+
+In `selfhosted` mode BYOK is always active (it's the only credentialing path).
+In `managed` mode it is opt-in per installation: the control plane sets
+`byok_enabled` on the installation row, and until it does, the auth middleware
+strips BYOK keys so a stored key can't spend against a deployment that bills
+prepaid credits. Once enabled, a BYOK turn debits no inference cost (the
+customer paid their own provider) and is charged a platform fee instead,
+recorded as a separate `byok_fee` ledger row.
+
+## Postgres
+
+Set `DATABASE_URL` directly, or compose it from the individual vars:
+
+| Variable                   | Default                           | Purpose |
+| -------------------------- | --------------------------------- | ------- |
+| `DATABASE_URL`             | *(none)*                          | Full connection string (takes precedence). |
+| `POSTGRES_USER`            | *(required if no `DATABASE_URL`)* | Username. |
+| `POSTGRES_PASSWORD`        | *(required if no `DATABASE_URL`)* | Password. |
+| `POSTGRES_DB`              | *(required if no `DATABASE_URL`)* | Database name. |
+| `POSTGRES_HOST`            | *(required if no `DATABASE_URL`)* | Hostname. |
+| `POSTGRES_PORT`            | `5432`                            | Port. |
+| `POSTGRES_SSLMODE`         | `require`                         | TLS mode. Use `disable` for local Docker. |
+| `POSTGRES_CONNECTION_NAME` | *(none)*                          | Cloud SQL Auth Proxy instance connection name. |
+
+## Server
+
+| Variable                 | Default      | Purpose |
+| ------------------------ | ------------ | ------- |
+| `PORT`                   | `8080`       | HTTP listen port. |
+| `ROUTER_DEPLOYMENT_MODE` | `selfhosted` | `selfhosted` mounts `/ui/*` and `/admin/v1/*`. `managed` skips both (for SaaS deployments with a separate admin UI). |
+| `ROUTER_ADMIN_PASSWORD`  | `admin`      | Dashboard password. Defaults to `admin` with a startup warning when unset — **set this for any internet-facing deployment**. |
+
+## Routing
+
+| Variable                          | Default                      | Purpose |
+| --------------------------------- | ---------------------------- | ------- |
+| `ROUTER_DEFAULT_STRATEGY`         | `cluster`                    | Strategy used when an installation has no persisted strategy. Change only after the policy rollout gate passes. |
+| `ROUTER_CLUSTER_VERSION`          | *(reads `artifacts/latest`)* | Pin a specific cluster artifact version (e.g. `v0.27`). |
+| `ROUTER_CLUSTER_EMBED_TIMEOUT_MS` | `200`                        | Per-request ONNX embed timeout. Increase for slower hosts. |
+| `ROUTER_EMBED_ONLY_USER_MESSAGE`  | `true`                       | Feed only user-role text to the embedder. Set `false` to embed the full concatenated turn. |
+| `ROUTER_STICKY_DECISION_TTL_MS`   | `0` (disabled)               | Reuse a routing decision per API key for this many ms. |
+| `ROUTER_SESSION_PIN_ENABLED`      | `true`                       | Pin a session to its first-routed model so multi-turn conversations stay coherent. |
+| `ROUTER_HARD_PIN_MODEL`           | *(none)*                     | Force every request to a specific model, bypassing the cluster scorer. Debugging only. |
+| `ROUTER_HARD_PIN_PROVIDER`        | *(none)*                     | Pair with `ROUTER_HARD_PIN_MODEL`. |
+| `ROUTER_HARD_PIN_EXPLORE`         | `true`                       | Pin Claude Code Task-tool sub-agent turns to `ROUTER_HARD_PIN_MODEL`/`ROUTER_HARD_PIN_PROVIDER` (or the cheapest deployed model, if those are unset). Set `false` to route sub-agents through the scorer like any other turn. |
+| `ROUTER_SUBAGENT_MODEL`           | *(none)*                     | Route Claude Code Task-tool sub-agent turns to a distinct model, independent of `ROUTER_HARD_PIN_MODEL` — e.g. a local/self-hosted OpenAI-compatible model (point `OPENROUTER_BASE_URL` at your local server) while the main loop keeps using Anthropic/whatever the scorer picks. Requires `ROUTER_SUBAGENT_PROVIDER`; either alone is ignored. Takes effect regardless of `ROUTER_HARD_PIN_EXPLORE`, but the HMM strategy keeps its own sub-agent handling and isn't affected. |
+| `ROUTER_SUBAGENT_PROVIDER`        | *(none)*                     | Pair with `ROUTER_SUBAGENT_MODEL`. |
+| `ROUTER_TRANSLATION_COMPATIBILITY_MODE` | `shadow` | Translation representability rollout: `off` disables broad filtering, `shadow` records candidate exclusions without changing routes, and `enforce` makes declared semantic requirements hard routing constraints. Native-only safety paths (such as unsupported Responses tool unions and native Gemini ingress) remain protected unless mode is `off`. |
+| `ROUTER_COMPACTION_PCT`           | `0.85`                       | Fraction of the largest eligible model's context window at which the proactive compaction cascade engages (clear old tool results → structured summary → trim). Range `(0,1]`; `0` disables compaction (over-window requests then 413). Mirrors Claude Code's ~0.85 auto-compact trigger. |
+| `ROUTER_ONNX_ASSETS_DIR`          | `/opt/router/assets`         | Directory containing `model.onnx` + `tokenizer.json`. |
+| `ROUTER_ONNX_LIBRARY_DIR`         | *(system default)*           | Path to `libonnxruntime` (e.g. `/opt/homebrew/lib` on Apple Silicon). |
+
+If the cluster scorer can't run (missing model, embed timeout, etc.), the
+router returns HTTP 503 — it does *not* silently fall back to a default
+model. Failures are loud by design.
+
+## Policy sidecars
+
+Out-of-process policy routers use the versioned contract in
+[Policy router harness](POLICY_ROUTER_HARNESS.md). The router remains the
+authority for candidate eligibility, provider binding, dispatch, retries,
+privacy context, and telemetry.
+
+| Variable                           | Default | Purpose |
+| ---------------------------------- | ------- | ------- |
+| `ROUTER_POLICY_SIDECARS`           | *(none)* | JSON object mapping a new strategy ID to its sidecar origin, for example `{"quality-v2":"https://quality-v2.internal"}`. IDs must match `[a-z][a-z0-9_-]{0,63}`. At most 16 may be configured. `cluster`, `rl`, `hmm`, and `bandit` are reserved. |
+| `ROUTER_POLICY_SIDECAR_AUTH`       | *(none)* | JSON object mapping configured generic strategy IDs to `none` or `google-id-token`, for example `{"quality-v2":"google-id-token"}`. Google ID-token mode uses the exact sidecar origin as token audience and fails router startup when application default credentials cannot build the client. |
+| `ROUTER_POLICY_SIDECAR_TIMEOUT_MS` | `3000`  | Total timeout for each generic policy decision, including transient retries. Also bounds startup capability discovery. |
+| `ROUTER_HMM_SIDECAR_URL`           | *(none)* | Legacy built-in HMM registration. Prefer the generic map for new strategies. |
+| `ROUTER_HMM_SIDECAR_TIMEOUT_MS`    | `3000`  | Total HMM decision timeout. |
+| `ROUTER_HMM_SIDECAR_AUTH`          | `none`  | Authentication for the HMM sidecar. Use `google-id-token` for managed Cloud Run; the exact sidecar origin is used as the token audience. |
+| `ROUTER_RL_SIDECAR_URL`            | *(none)* | Legacy built-in RL registration. Prefer the generic map for new strategies. |
+| `ROUTER_RL_SIDECAR_TIMEOUT_MS`     | `3000`  | Total RL decision timeout. |
+| `ROUTER_RL_SIDECAR_MODAL_KEY`      | *(none)* | Optional Modal proxy token id (`Modal-Key`) when the RL sidecar is a Modal ASGI app with `requires_proxy_auth`. |
+| `ROUTER_RL_SIDECAR_MODAL_SECRET`   | *(none)* | Optional Modal proxy token secret (`Modal-Secret`); required when `ROUTER_RL_SIDECAR_MODAL_KEY` is set. |
+
+`GET /capabilities` is queried at router startup. A failed probe does not
+silently remove the strategy: serving stays registered and fails closed if
+`POST /route` is unavailable, while optional outcome and feedback callbacks
+remain disabled until the next successful restart. This keeps persisted
+rollout state visible without pretending that a different strategy served.
+
+Policy route requests retry network failures and HTTP 500, 502, 503, and 504
+up to three attempts within the configured total timeout. Other failures are
+not retried. An unavailable or invalid policy decision returns HTTP 503; it
+never falls back to cluster or another policy.
+
+### Self-hosted frozen HMM sidecar
+
+The repository includes an optional companion container under
+`sidecars/hmm/`. Start it with `make up-hmm`; the normal `make up` and
+`make full-setup` paths remain cluster-only. HMM is not selected unless an
+operator explicitly chooses the `hmm` strategy.
+
+| Variable | Default | Purpose |
+| --- | --- | --- |
+| `HMM_PACKAGE_URL` | Published `hmm-model-v1` GitHub Release asset | HTTPS URL for the portable frozen package. |
+| `HMM_PACKAGE_PATH` | *(none)* | Local package path when running the sidecar outside Compose. Set exactly one of path or URL. |
+| `HMM_PACKAGE_SHA256` | Pinned release digest in the sidecar image | Required digest for URL downloads; optional but recommended with a local path. |
+| `HMM_ARTIFACT_CACHE_DIR` | `/tmp/workweave-hmm-artifacts` | Atomic download/extraction cache. |
+| `HMM_EMBEDDING_PROVIDER` | `google` | `google` or `openai-compatible`. |
+| `GOOGLE_API_KEY` | *(none)* | Google Gemini API key for the exact embedding model named by the artifact. |
+| `HMM_EMBEDDING_BASE_URL` | *(none)* | Base URL for an OpenAI-compatible `/embeddings` endpoint. |
+| `HMM_EMBEDDING_API_KEY` | *(none)* | Optional bearer token for that endpoint. |
+| `HMM_EMBEDDING_MODEL` | Artifact model ID | Model sent to an OpenAI-compatible endpoint. |
+
+The published v1 package is tied to `google/gemini-embedding-2` at 3,072
+dimensions. Those embedding values are direct classifier features and define
+the HMM emission space, so another 3,072-dimensional model is not a substitute.
+At startup the sidecar embeds a fixed probe and compares it to the reference
+vector stored in the artifact. Readiness fails closed when the endpoint serves
+an incompatible vector space. A fully local embedder is supported only with a
+separately trained package that declares and probes that embedder.
+
+The self-hosted sidecar is frozen: it keeps only a bounded in-memory embedding
+cache, advertises no learning/outcome/feedback callbacks, and never persists
+request or response content.
+
+Selection precedence is:
+
+1. An authorized internal `x-weave-router-strategy` request override.
+2. The installation's persisted strategy.
+3. `ROUTER_DEFAULT_STRATEGY`.
+
+The request header is ignored unless the installation explicitly enables
+policy-header overrides. `x-weave-router-debug` follows the same authorization
+rule and cannot enable training. Shadow decisions are always non-dispatching,
+non-debug, and non-learning.
+
+## BYOK encryption
+
+| Variable                      | Default   | Purpose |
+| ----------------------------- | --------- | ------- |
+| `EXTERNAL_KEY_ENCRYPTION_KEY` | *(unset)* | Tink AES-256-GCM keyset (JSON) that encrypts customer-supplied upstream provider keys at rest. |
+
+**If unset, BYOK secrets are stored unencrypted** and the router logs a
+`WARN` at startup. Set this in any deployment that handles real customer
+secrets. Generate with:
+
+```bash
+tinkey create-keyset --key-template AES256_GCM --out-format json
+```
+
+A *malformed* keyset still fails closed (the router refuses to boot); only a
+genuinely absent value triggers the unencrypted bypass.
+
+## Telemetry (OpenTelemetry)
+
+The router exports per-request trace spans to any OTLP-compatible collector.
+Each proxied request emits two spans (`router.decision` and `router.upstream`)
+with routing decisions, token usage, cost estimates, and latency. Export is
+async/non-blocking; when `OTEL_EXPORTER_OTLP_ENDPOINT` is unset, OTel is
+fully disabled at zero runtime cost. Everything the router records leaves the
+process over OTLP only — there is no hardcoded analytics endpoint.
+
+### High-fidelity content capture (`router.call` log records)
+
+When `WV_CAPTURE_CONTENT` is set, the router additionally emits a `router.call`
+OTLP **log record** per upstream call to `${OTEL_EXPORTER_OTLP_ENDPOINT}/v1/logs`.
+Each record carries the same routing/decision metadata as the spans plus the
+call outcome, and — depending on the mode — the request/response bodies. This
+is the ML-ready event stream (one record per LLM call, full inputs and
+outputs). It is **opt-in**: with `WV_CAPTURE_CONTENT` unset (the default) no
+log records are emitted and behavior is unchanged.
+
+| Variable             | Default | Purpose |
+| -------------------- | ------- | ------- |
+| `WV_CAPTURE_CONTENT` | `off`   | `off` = no log records; `hashed` = metadata + SHA-256 content hashes (no raw text); `full` = metadata + raw request/response bodies. |
+| `WV_CAPTURE_MAX_BYTES` | `1048576` | Max buffered response bytes; larger responses are dropped and flagged `io.truncated=true` (the client still receives the full stream). |
+
+Captured bodies are in the client's native wire format (Anthropic / OpenAI /
+Gemini, matching the inbound surface). The `router.deployment_mode` resource
+attribute (`selfhosted` / `managed`) is stamped on every export so a collector
+can branch redaction or content-opt-out by deployment.
+
+
+| Variable                         | Default      | Purpose |
+| -------------------------------- | ------------ | ------- |
+| `OTEL_EXPORTER_OTLP_ENDPOINT`    | *(disabled)* | Collector base URL (e.g. `https://api.honeycomb.io`). Required to enable. |
+| `OTEL_EXPORTER_OTLP_HEADERS`     | *(none)*     | Comma-separated `key=value` headers (e.g. auth tokens). |
+| `OTEL_EXPORTER_OTLP_TIMEOUT`     | `10000`      | Per-export HTTP timeout in ms. |
+| `OTEL_SERVICE_NAME`              | `router`     | `service.name` resource attribute. |
+| `OTEL_RESOURCE_ATTRIBUTES`       | *(none)*     | Comma-separated `key=value` resource attributes. |
+| `OTEL_BSP_MAX_QUEUE_SIZE`        | `1000`       | Span queue capacity. Spans drop when full. |
+| `OTEL_BSP_MAX_EXPORT_BATCH_SIZE` | `50`         | Max spans per OTLP POST. |
+| `OTEL_BSP_SCHEDULE_DELAY`        | `500`        | Partial-batch flush interval in ms. |
+| `OTEL_EXPORT_WORKERS`            | `2`          | Export-goroutine count (spans and logs each get this many workers). |
+
+The first five follow the [OTel SDK env spec](https://opentelemetry.io/docs/specs/otel/configuration/sdk-environment-variables/);
+`OTEL_BSP_*` follows the [Batch Span Processor spec](https://opentelemetry.io/docs/specs/otel/trace/sdk/#batch-span-processor).
+`OTEL_EXPORT_WORKERS` is a router-specific extension.
+
+## Cluster-routing artifacts
+
+Each embedder the cluster scorer can use needs two files at runtime —
+`model.onnx` (INT8-quantized) and `tokenizer.json` — in its own subdirectory
+of the assets root, keyed by embedder ID:
+
+- `jina-v2-base-code-int8/` — from the public
+  [`jinaai/jina-embeddings-v2-base-code`](https://huggingface.co/jinaai/jina-embeddings-v2-base-code)
+  HuggingFace repo (Jina's own INT8 export; we don't maintain our own
+  quantization). Default for every bundle through v0.66; the flat legacy
+  layout (`<root>/model.onnx`) still resolves for this embedder.
+- `qwen3-embedding-0.6b-int8/` — produced by `scripts/export_qwen3_onnx.py`
+  (Qwen3-Embedding-0.6B with last-token pooling baked into the graph) and
+  uploaded to the public
+  [`weave-eng/qwen3-embedding-0.6b-onnx-router`](https://huggingface.co/weave-eng/qwen3-embedding-0.6b-onnx-router)
+  HF repo. Only needed when serving a bundle whose `metadata.yaml` declares
+  this embedder; the runtime loads embedders lazily.
+
+Neither is committed to git.
+
+**Docker (default):** the Dockerfile downloads the files at image build time
+into `/opt/router/assets/<embedder-id>/`. Both repos are public — no token
+needed (the optional `hf_token` secret still works for rate-limit headroom);
+set `HF_QWEN_REPO=` (empty) to skip the Qwen pull for Jina-only deploys.
+
+**`make dev` (host-mode hot reload):** fetch the Jina files once into a local
+directory and point `ROUTER_ONNX_ASSETS_DIR` at it:
+
+```bash
+mkdir -p assets/jina-v2-base-code-int8
+BASE="https://huggingface.co/jinaai/jina-embeddings-v2-base-code/resolve/516f4baf13dec4ddddda8631e019b5737c8bc250"
+curl -L "$BASE/onnx/model_quantized.onnx" -o assets/jina-v2-base-code-int8/model.onnx
+curl -L "$BASE/tokenizer.json" -o assets/jina-v2-base-code-int8/tokenizer.json
+echo "ROUTER_ONNX_ASSETS_DIR=$(pwd)/assets" >> .env.local
+```
+
+To also serve Qwen bundles locally, run `scripts/export_qwen3_onnx.py
+--out-dir assets/qwen3-embedding-0.6b-int8` (or download the uploaded export
+into that directory).
+
+The pinned revisions (`HF_MODEL_REVISION`, `HF_QWEN_REVISION`) in the
+Dockerfile keep local dev and the container build on the same weights. Bump
+deliberately if you want a newer export.
+
+The committed cluster artifacts (centroids, rankings, model registry,
+metadata) live under `internal/router/cluster/artifacts/v<X.Y>/`. The
+`artifacts/latest` pointer selects the default served version;
+`ROUTER_CLUSTER_VERSION` overrides per-deployment.

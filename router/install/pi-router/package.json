@@ -1,0 +1,13 @@
+{
+  "name": "@workweave/router-pi-extension",
+  "private": true,
+  "type": "module",
+  "description": "The pi routing extension bundled into @workweave/router. NOT published separately: src/ is copied into the @workweave/router package at prepack and loaded via that package's pi.extensions. This manifest just marks the sources as ESM and declares the pi peer deps for local typecheck.",
+  "peerDependencies": {
+    "@mariozechner/pi-agent-core": "*",
+    "@mariozechner/pi-ai": "*",
+    "@mariozechner/pi-coding-agent": "*",
+    "@mariozechner/pi-tui": "*",
+    "typebox": "*"
+  }
+}

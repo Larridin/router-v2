@@ -1,0 +1,523 @@
+{
+  "best_single_model": "Qwen3-8B",
+  "best_single_accuracy": 0.6626391062833973,
+  "oracle_accuracy": 0.8963865912059208,
+  "routers": [
+    {
+      "name": "Baseline Cluster",
+      "accuracy": 0.7150266310655875,
+      "raw_accuracy": 0.7048323900740096,
+      "vs_best_single": 0.05238752478219022,
+      "vs_oracle_pct": 79.76766253315466,
+      "time_s": 0.7167789936065674,
+      "n_queries": 2297,
+      "dataset_perf": {
+        "aime": {
+          "accuracy": 0.6666666666666666,
+          "correct": 8.0,
+          "total": 12
+        },
+        "bbh": {
+          "accuracy": 0.9166666666666666,
+          "correct": 198.0,
+          "total": 216
+        },
+        "emorynlp": {
+          "accuracy": 0.35714285714285715,
+          "correct": 50.0,
+          "total": 140
+        },
+        "finqa": {
+          "accuracy": 0.7456140350877193,
+          "correct": 170.0,
+          "total": 228
+        },
+        "gpqa": {
+          "accuracy": 0.6,
+          "correct": 24.0,
+          "total": 40
+        },
+        "humaneval": {
+          "accuracy": 0.696969696969697,
+          "correct": 23.0,
+          "total": 33
+        },
+        "kandk": {
+          "accuracy": 0.7785714285714286,
+          "correct": 109.0,
+          "total": 140
+        },
+        "korbench": {
+          "accuracy": 0.62,
+          "correct": 155.0,
+          "total": 250
+        },
+        "livecodebench": {
+          "accuracy": 0.6398104265402843,
+          "correct": 135.0,
+          "total": 211
+        },
+        "math500": {
+          "accuracy": 0.89,
+          "correct": 89.0,
+          "total": 100
+        },
+        "mathbench": {
+          "accuracy": 1.0,
+          "correct": 30.0,
+          "total": 30
+        },
+        "mbpp": {
+          "accuracy": 0.7589743589743589,
+          "correct": 148.0,
+          "total": 195
+        },
+        "medqa": {
+          "accuracy": 0.8117647058823529,
+          "correct": 207.0,
+          "total": 255
+        },
+        "meld": {
+          "accuracy": 0.5182186234817814,
+          "correct": 128.0,
+          "total": 247
+        },
+        "mmlupro": {
+          "accuracy": 0.725,
+          "correct": 145.0,
+          "total": 200
+        }
+      }
+    },
+    {
+      "name": "Confidence Router V1",
+      "accuracy": 0.6955751936141501,
+      "raw_accuracy": 0.694819329560296,
+      "vs_best_single": 0.03293608733075282,
+      "vs_oracle_pct": 77.59767944301616,
+      "time_s": 32.48653292655945,
+      "n_queries": 2297,
+      "dataset_perf": {
+        "aime": {
+          "accuracy": 0.6666666666666666,
+          "correct": 8.0,
+          "total": 12
+        },
+        "bbh": {
+          "accuracy": 0.9166666666666666,
+          "correct": 198.0,
+          "total": 216
+        },
+        "emorynlp": {
+          "accuracy": 0.35714285714285715,
+          "correct": 50.0,
+          "total": 140
+        },
+        "finqa": {
+          "accuracy": 0.7456140350877193,
+          "correct": 170.0,
+          "total": 228
+        },
+        "gpqa": {
+          "accuracy": 0.575,
+          "correct": 23.0,
+          "total": 40
+        },
+        "humaneval": {
+          "accuracy": 0.5454545454545454,
+          "correct": 18.0,
+          "total": 33
+        },
+        "kandk": {
+          "accuracy": 0.7785714285714286,
+          "correct": 109.0,
+          "total": 140
+        },
+        "korbench": {
+          "accuracy": 0.62,
+          "correct": 155.0,
+          "total": 250
+        },
+        "livecodebench": {
+          "accuracy": 0.6398104265402843,
+          "correct": 135.0,
+          "total": 211
+        },
+        "math500": {
+          "accuracy": 0.89,
+          "correct": 89.0,
+          "total": 100
+        },
+        "mathbench": {
+          "accuracy": 0.9666666666666667,
+          "correct": 29.0,
+          "total": 30
+        },
+        "mbpp": {
+          "accuracy": 0.6820512820512821,
+          "correct": 133.0,
+          "total": 195
+        },
+        "medqa": {
+          "accuracy": 0.8117647058823529,
+          "correct": 207.0,
+          "total": 255
+        },
+        "meld": {
+          "accuracy": 0.5182186234817814,
+          "correct": 128.0,
+          "total": 247
+        },
+        "mmlupro": {
+          "accuracy": 0.72,
+          "correct": 144.0,
+          "total": 200
+        }
+      }
+    },
+    {
+      "name": "Confidence Router V2",
+      "accuracy": 0.7076935881042681,
+      "raw_accuracy": 0.695690030474532,
+      "vs_best_single": 0.045054481820870795,
+      "vs_oracle_pct": 78.94959552576512,
+      "time_s": 0.6278641223907471,
+      "n_queries": 2297,
+      "dataset_perf": {
+        "aime": {
+          "accuracy": 0.6666666666666666,
+          "correct": 8.0,
+          "total": 12
+        },
+        "bbh": {
+          "accuracy": 0.9120370370370371,
+          "correct": 197.0,
+          "total": 216
+        },
+        "emorynlp": {
+          "accuracy": 0.36428571428571427,
+          "correct": 51.0,
+          "total": 140
+        },
+        "finqa": {
+          "accuracy": 0.7456140350877193,
+          "correct": 170.0,
+          "total": 228
+        },
+        "gpqa": {
+          "accuracy": 0.65,
+          "correct": 26.0,
+          "total": 40
+        },
+        "humaneval": {
+          "accuracy": 0.6363636363636364,
+          "correct": 21.0,
+          "total": 33
+        },
+        "kandk": {
+          "accuracy": 0.7571428571428571,
+          "correct": 106.0,
+          "total": 140
+        },
+        "korbench": {
+          "accuracy": 0.608,
+          "correct": 152.0,
+          "total": 250
+        },
+        "livecodebench": {
+          "accuracy": 0.6398104265402843,
+          "correct": 135.0,
+          "total": 211
+        },
+        "math500": {
+          "accuracy": 0.89,
+          "correct": 89.0,
+          "total": 100
+        },
+        "mathbench": {
+          "accuracy": 1.0,
+          "correct": 30.0,
+          "total": 30
+        },
+        "mbpp": {
+          "accuracy": 0.7282051282051282,
+          "correct": 142.0,
+          "total": 195
+        },
+        "medqa": {
+          "accuracy": 0.792156862745098,
+          "correct": 202.0,
+          "total": 255
+        },
+        "meld": {
+          "accuracy": 0.5101214574898786,
+          "correct": 126.0,
+          "total": 247
+        },
+        "mmlupro": {
+          "accuracy": 0.715,
+          "correct": 143.0,
+          "total": 200
+        }
+      }
+    },
+    {
+      "name": "Ensemble Router",
+      "accuracy": 0.7100710755100319,
+      "raw_accuracy": 0.7004788855028298,
+      "vs_best_single": 0.04743196922663462,
+      "vs_oracle_pct": 79.21482566520366,
+      "time_s": 8.44271206855774,
+      "n_queries": 2297,
+      "dataset_perf": {
+        "aime": {
+          "accuracy": 0.6666666666666666,
+          "correct": 8.0,
+          "total": 12
+        },
+        "bbh": {
+          "accuracy": 0.9166666666666666,
+          "correct": 198.0,
+          "total": 216
+        },
+        "emorynlp": {
+          "accuracy": 0.35714285714285715,
+          "correct": 50.0,
+          "total": 140
+        },
+        "finqa": {
+          "accuracy": 0.7456140350877193,
+          "correct": 170.0,
+          "total": 228
+        },
+        "gpqa": {
+          "accuracy": 0.6,
+          "correct": 24.0,
+          "total": 40
+        },
+        "humaneval": {
+          "accuracy": 0.696969696969697,
+          "correct": 23.0,
+          "total": 33
+        },
+        "kandk": {
+          "accuracy": 0.7785714285714286,
+          "correct": 109.0,
+          "total": 140
+        },
+        "korbench": {
+          "accuracy": 0.604,
+          "correct": 151.0,
+          "total": 250
+        },
+        "livecodebench": {
+          "accuracy": 0.6398104265402843,
+          "correct": 135.0,
+          "total": 211
+        },
+        "math500": {
+          "accuracy": 0.89,
+          "correct": 89.0,
+          "total": 100
+        },
+        "mathbench": {
+          "accuracy": 0.9666666666666667,
+          "correct": 29.0,
+          "total": 30
+        },
+        "mbpp": {
+          "accuracy": 0.7589743589743589,
+          "correct": 148.0,
+          "total": 195
+        },
+        "medqa": {
+          "accuracy": 0.8117647058823529,
+          "correct": 207.0,
+          "total": 255
+        },
+        "meld": {
+          "accuracy": 0.5182186234817814,
+          "correct": 128.0,
+          "total": 247
+        },
+        "mmlupro": {
+          "accuracy": 0.7,
+          "correct": 140.0,
+          "total": 200
+        }
+      }
+    },
+    {
+      "name": "Adaptive Cluster",
+      "accuracy": 0.7204443403089723,
+      "raw_accuracy": 0.7087505441880714,
+      "vs_best_single": 0.057805234025575025,
+      "vs_oracle_pct": 80.37205680863086,
+      "time_s": 0.5341031551361084,
+      "n_queries": 2297,
+      "dataset_perf": {
+        "aime": {
+          "accuracy": 0.6666666666666666,
+          "correct": 8.0,
+          "total": 12
+        },
+        "bbh": {
+          "accuracy": 0.8703703703703703,
+          "correct": 188.0,
+          "total": 216
+        },
+        "emorynlp": {
+          "accuracy": 0.35714285714285715,
+          "correct": 50.0,
+          "total": 140
+        },
+        "finqa": {
+          "accuracy": 0.7368421052631579,
+          "correct": 168.0,
+          "total": 228
+        },
+        "gpqa": {
+          "accuracy": 0.6,
+          "correct": 24.0,
+          "total": 40
+        },
+        "humaneval": {
+          "accuracy": 0.7272727272727273,
+          "correct": 24.0,
+          "total": 33
+        },
+        "kandk": {
+          "accuracy": 0.7785714285714286,
+          "correct": 109.0,
+          "total": 140
+        },
+        "korbench": {
+          "accuracy": 0.632,
+          "correct": 158.0,
+          "total": 250
+        },
+        "livecodebench": {
+          "accuracy": 0.6445497630331753,
+          "correct": 136.0,
+          "total": 211
+        },
+        "math500": {
+          "accuracy": 0.92,
+          "correct": 92.0,
+          "total": 100
+        },
+        "mathbench": {
+          "accuracy": 1.0,
+          "correct": 30.0,
+          "total": 30
+        },
+        "mbpp": {
+          "accuracy": 0.7589743589743589,
+          "correct": 148.0,
+          "total": 195
+        },
+        "medqa": {
+          "accuracy": 0.8117647058823529,
+          "correct": 207.0,
+          "total": 255
+        },
+        "meld": {
+          "accuracy": 0.5425101214574899,
+          "correct": 134.0,
+          "total": 247
+        },
+        "mmlupro": {
+          "accuracy": 0.76,
+          "correct": 152.0,
+          "total": 200
+        }
+      }
+    },
+    {
+      "name": "Ensemble+Adaptive",
+      "accuracy": 0.7127075041403931,
+      "raw_accuracy": 0.7087505441880714,
+      "vs_best_single": 0.050068397856995794,
+      "vs_oracle_pct": 79.50894303110651,
+      "time_s": 1.3693578243255615,
+      "n_queries": 2297,
+      "dataset_perf": {
+        "aime": {
+          "accuracy": 0.5833333333333334,
+          "correct": 7.0,
+          "total": 12
+        },
+        "bbh": {
+          "accuracy": 0.8981481481481481,
+          "correct": 194.0,
+          "total": 216
+        },
+        "emorynlp": {
+          "accuracy": 0.36428571428571427,
+          "correct": 51.0,
+          "total": 140
+        },
+        "finqa": {
+          "accuracy": 0.75,
+          "correct": 171.0,
+          "total": 228
+        },
+        "gpqa": {
+          "accuracy": 0.625,
+          "correct": 25.0,
+          "total": 40
+        },
+        "humaneval": {
+          "accuracy": 0.696969696969697,
+          "correct": 23.0,
+          "total": 33
+        },
+        "kandk": {
+          "accuracy": 0.7785714285714286,
+          "correct": 109.0,
+          "total": 140
+        },
+        "korbench": {
+          "accuracy": 0.62,
+          "correct": 155.0,
+          "total": 250
+        },
+        "livecodebench": {
+          "accuracy": 0.6350710900473934,
+          "correct": 134.0,
+          "total": 211
+        },
+        "math500": {
+          "accuracy": 0.9,
+          "correct": 90.0,
+          "total": 100
+        },
+        "mathbench": {
+          "accuracy": 0.9666666666666667,
+          "correct": 29.0,
+          "total": 30
+        },
+        "mbpp": {
+          "accuracy": 0.7743589743589744,
+          "correct": 151.0,
+          "total": 195
+        },
+        "medqa": {
+          "accuracy": 0.807843137254902,
+          "correct": 206.0,
+          "total": 255
+        },
+        "meld": {
+          "accuracy": 0.5303643724696356,
+          "correct": 131.0,
+          "total": 247
+        },
+        "mmlupro": {
+          "accuracy": 0.76,
+          "correct": 152.0,
+          "total": 200
+        }
+      }
+    }
+  ]
+}

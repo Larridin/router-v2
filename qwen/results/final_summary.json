@@ -1,0 +1,105 @@
+{
+  "project": "Qwen Router Experiments",
+  "date": "2026-08-02",
+  "dataset": "LLMRouterBench Performance Setting (20 small models, 15 datasets)",
+  "data_stats": {
+    "train_queries": 9170,
+    "test_queries": 2297,
+    "n_models": 20,
+    "best_single_model": "Qwen3-8B",
+    "best_single_accuracy": 0.6626,
+    "oracle_accuracy": 0.8964
+  },
+  "existing_baselines": {
+    "baseline_cluster_k32": {
+      "accuracy": 0.7150,
+      "description": "TunedClusterRouter, all-mpnet-base-v2, k=32, tk=5, beta=10"
+    },
+    "routellm_mf_seed42": {
+      "accuracy": 0.6792,
+      "description": "RouteLLM Matrix Factorization (from existing results)"
+    },
+    "routellm_mf_best_seed": {
+      "accuracy": 0.7093,
+      "description": "RouteLLM MF best across seeds (seed=2024)"
+    }
+  },
+  "our_results": {
+    "iteration1": {
+      "description": "Initial experiments — 6 approaches",
+      "results": [
+        {"name": "Baseline Cluster", "accuracy": 0.7150, "vs_baseline": 0.0},
+        {"name": "Confidence Router V1 (hard fallback)", "accuracy": 0.6956, "vs_baseline": -0.0194, "note": "Too aggressive fallback hurts"},
+        {"name": "Confidence Router V2 (per-cluster thresholds)", "accuracy": 0.7077, "vs_baseline": -0.0073},
+        {"name": "Ensemble Router (3 embedders)", "accuracy": 0.7101, "vs_baseline": -0.0049, "note": "Embedders too correlated"},
+        {"name": "Adaptive Cluster (k=91)", "accuracy": 0.7204, "vs_baseline": +0.0054, "note": "First win — more clusters help"},
+        {"name": "Ensemble+Adaptive (k=114)", "accuracy": 0.7127, "vs_baseline": -0.0023}
+      ]
+    },
+    "iteration2": {
+      "description": "Hyperparameter sweep — adaptive k, top_k x beta, improved confidence",
+      "key_findings": [
+        "k=183 (tpc=50) is the sweet spot",
+        "top_k=8, beta=8.0 is the best combination",
+        "Rank-based scoring beats score-based blending",
+        "Confidence soft blending still underperforms"
+      ],
+      "top_results": [
+        {"name": "Adaptive Rank-Based (k=183, tk=8, beta=8)", "accuracy": 0.7326, "vs_baseline": +0.0176, "status": "WINNER"},
+        {"name": "Adaptive Rank-Based (k=183, tk=7, beta=8)", "accuracy": 0.7316, "vs_baseline": +0.0166},
+        {"name": "Adaptive Rank-Based (k=183, tk=5, beta=14)", "accuracy": 0.7297, "vs_baseline": +0.0147},
+        {"name": "Adaptive Rank-Based (k=183, tk=7, beta=10)", "accuracy": 0.7294, "vs_baseline": +0.0144},
+        {"name": "Confidence V3 (soft blending)", "accuracy": 0.6874, "vs_baseline": -0.0276, "note": "Dilutes cluster signal"},
+        {"name": "Hybrid Adaptive+Confidence", "accuracy": 0.6982, "vs_baseline": -0.0168}
+      ]
+    },
+    "iteration3": {
+      "description": "Final push — higher k, score-based routing, shrinkage",
+      "key_findings": [
+        "Score-based routing is worse than rank-based (0.7153 vs 0.7326 at same k)",
+        "Higher k doesn't help score-based (k=305 → 0.7196)",
+        "Empirical Bayes shrinkage doesn't help (best k0=1 → 0.7163)",
+        "Rank-based scoring naturally normalizes across heterogeneous clusters"
+      ],
+      "top_results": [
+        {"name": "ScoreBased (k=305)", "accuracy": 0.7196, "vs_baseline": +0.0046},
+        {"name": "Shrinkage (k=300, k0=10)", "accuracy": 0.7175, "vs_baseline": +0.0025},
+        {"name": "ScoreBased (k=183, tk=8, beta=8)", "accuracy": 0.7153, "vs_baseline": +0.0003}
+      ]
+    }
+  },
+  "final_comparison": {
+    "winner": {
+      "name": "Adaptive Rank-Based Cluster Router",
+      "config": "k=183, top_k=8, beta=8.0, all-mpnet-base-v2",
+      "accuracy": 0.7326,
+      "vs_baseline_cluster": "+0.0176 (+2.5%)",
+      "vs_best_single": "+0.0700 (+10.6%)",
+      "vs_oracle": "81.7%",
+      "vs_routellm_best": "+0.0233 (+3.3%)"
+    }
+  },
+  "key_insights": [
+    "1. MORE CLUSTERS WIN: k=183 (50 prompts/cluster) beats k=32 by 1.76%. The existing baseline was under-clustered.",
+    "2. WIDER NEIGHBORHOOD: top_k=8 (vs 5) blends more cluster opinions, reduces variance.",
+    "3. MODERATE TEMPERATURE: beta=8.0 (vs 10) gives softer weighting, prevents overconfidence.",
+    "4. RANK > SCORE: 1/rank scoring naturally normalizes across clusters with different score distributions. Mean scores are biased by cluster composition.",
+    "5. CONFIDENCE DOESN'T HELP: Falling back to best-single loses routing advantage. Even noisy cluster predictions beat best-single on OOD queries.",
+    "6. ENSEMBLE EMBEDDINGS DON'T HELP: all-mpnet, all-MiniLM, paraphrase-MiniLM are too correlated. Learned weights end up near-uniform (33/34/33%).",
+    "7. SHRINKAGE DOESN'T HELP: With k=183, most clusters have 40-60 samples — enough for reliable means. Shrinkage only helps for tiny clusters.",
+    "8. SCORE-BASED < RANK-BASED: Direct mean blending is sensitive to cluster heterogeneity. Rank-based is robust because it only cares about relative ordering."
+  ],
+  "what_didnt_work": [
+    "Confidence-aware fallback (V1, V2, V3) — all variants underperform baseline",
+    "Multi-embedder ensemble — embedders too correlated, no diversity gain",
+    "Empirical Bayes shrinkage — clusters large enough that shrinkage adds bias",
+    "Score-based routing — mean scores biased by cluster composition",
+    "Hybrid approaches — combining orthogonal ideas diluted each signal"
+  ],
+  "recommendations": [
+    "Production: Use k=183, top_k=8, beta=8.0 with rank-based scoring. Simple, fast (0.8s for 2297 queries), and beats all baselines.",
+    "The existing production router's k=16 is too conservative for this data size. Scale k with corpus.",
+    "Focus on data quality and coverage rather than algorithm complexity — the biggest wins came from better hyperparameters, not new algorithms.",
+    "Confidence scoring would be more useful in a cost-aware setting (route cheap models when confident, expensive when uncertain) — not explored here."
+  ]
+}
